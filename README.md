@@ -129,6 +129,25 @@ async with AsyncNukez(
 
 ---
 
+## Storage Providers
+
+Pass the **arg name** as the `provider` kwarg to `request_storage()`, `get_provider_info()`, and other methods that accept a provider.
+
+| Provider | Arg Name | Best For |
+|----------|----------|----------|
+| **Google Cloud Storage** | `"gcs"` | General-purpose, large files, proof-of-storage |
+| **MongoDB** | `"mongodb"` | Fast read/write, small context/state data (16 MB per-doc limit) |
+| **Filecoin** | `"filecoin"` | Content-addressed decentralized storage |
+| **Arweave** | `"arweave"` | Permanent, immutable storage |
+| **Firestore** | `"firestore"` | Firebase document store (1 MB per-doc limit) |
+| **Storj** | `"storj"` | S3-compatible, decentralized storage |
+
+```python
+request = client.request_storage(units=1, provider="mongodb")
+```
+
+---
+
 ## Sandboxed App Uploads
 
 Most Python users should start with `upload_file_path()`, `bulk_upload_paths()`,
