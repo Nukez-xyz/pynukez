@@ -236,7 +236,7 @@ request.next_step        # Human-readable guidance for the agent
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `units` | `int` | `1` | Number of storage units |
-| `provider` | `str` | `None` | Storage backend: `"gcs"`, `"mongodb"`, `"storj"` |
+| `provider` | `str` | `None` | Storage backend: `"gcs"`, `"mongodb"`, `"filecoin"`, `"arweave"`, `"firestore"`, `"storj"` |
 | `pay_network` | `str` | `None` | Payment chain: friendly names such as `"solana-mainnet"` / `"monad-mainnet"` or CAIP-2 values such as `"solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"` / `"eip155:143"` |
 | `pay_asset` | `str` | `None` | Payment token: `"SOL"`, `"MON"`, `"USDC"`, `"USDT"`, `"WETH"` |
 
@@ -1074,13 +1074,16 @@ All types are plain Python `@dataclass` objects.
 
 ## Storage Providers
 
-| Provider | Best For | Signed URLs | Streaming | Immutable |
-|----------|----------|-------------|-----------|-----------|
-| **GCS** | Archival, large files, proof-of-storage | Yes | Yes | No |
-| **MongoDB** | Fast read/write, small context/state data | Yes | Yes | No |
-| **Storj** | S3-compatible, decentralized | Yes | Yes | No |
-| **Arweave** | Permanent storage | Yes | Yes | Yes |
-| **Filecoin** | Content-addressed storage | Yes | Yes | Yes |
+Pass the **Arg Name** as the `provider` kwarg to `request_storage()`, `get_provider_info()`, and other methods that accept a provider.
+
+| Provider | Arg Name | Best For |
+|----------|----------|----------|
+| **Google Cloud Storage** | `"gcs"` | General-purpose, large files, proof-of-storage |
+| **MongoDB** | `"mongodb"` | Fast read/write, small context/state data (16 MB per-doc limit) |
+| **Filecoin** | `"filecoin"` | Content-addressed decentralized storage |
+| **Arweave** | `"arweave"` | Permanent, immutable storage |
+| **Firestore** | `"firestore"` | Firebase document store (1 MB per-doc limit) |
+| **Storj** | `"storj"` | S3-compatible, decentralized storage |
 
 Select a provider at storage request time:
 

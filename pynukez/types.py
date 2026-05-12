@@ -351,7 +351,11 @@ class DiscoveryDoc:
 
 @dataclass(frozen=True)
 class ProviderInfo:
-    """Storage provider metadata and capabilities."""
+    """Storage provider metadata and capabilities.
+
+    Accepted provider arg names: "gcs", "mongodb", "filecoin",
+    "arweave", "firestore", "storj".  See PROVIDERS for the full registry.
+    """
     id: str                                     # "gcs", "mongodb", etc.
     supports_signed_urls: bool = True
     supports_streaming: bool = True
@@ -361,6 +365,16 @@ class ProviderInfo:
 
 
 # Static registry mirroring gateway/app/core/storage_providers/
+#
+# Accepted provider arg names (pass as the ``provider`` kwarg to
+# ``request_storage()``, ``get_provider_info()``, etc.):
+#
+#   "gcs"        — Google Cloud Storage
+#   "mongodb"    — MongoDB
+#   "filecoin"   — Filecoin
+#   "arweave"    — Arweave
+#   "firestore"  — Firestore
+#   "storj"      — Storj
 PROVIDERS: Dict[str, ProviderInfo] = {
     "gcs":       ProviderInfo("gcs"),
     "mongodb":   ProviderInfo("mongodb", supports_signed_urls=False, supports_streaming=False, max_object_size=16_777_216),

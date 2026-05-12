@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "Nukez", email = "dev@nukez.xyz"}
+    {name = "Zachary Hanson", email = "zh@nukez.xyz"}
 ]
 keywords = [
     "ai",
