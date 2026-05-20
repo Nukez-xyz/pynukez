@@ -654,8 +654,12 @@ class Nukez:
                 for opt in request.payment_options:
                     if opt.get("pay_asset", "").upper() != pay_asset.upper():
                         continue
-                    # If a network hint was given, also match on it
-                    if _net_hint and _net_hint not in opt.get("network", "").lower():
+                    # If a network hint was given, also match on it.
+                    # Normalize both sides through caip2_to_friendly so a
+                    # friendly alias ("solana-mainnet") matches the CAIP-2
+                    # form the gateway returns ("solana:5eykt4UsFv8...").
+                    if _net_hint and caip2_to_friendly(opt.get("network", "")).lower() != \
+                            caip2_to_friendly(pay_network or "").lower():
                         continue
                     # Found matching option — override top-level fields
                     request.pay_to_address = opt["pay_to_address"]
