@@ -781,8 +781,8 @@ print(signer.identity, signer.sig_alg)  # "0xabc..." "secp256k1"
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `build_signed_envelope(signer, receipt_id, method, path, ops, body, ttl_seconds=300, delegating=False)` | `SignedEnvelope` | Create signed auth headers |
-| `build_unsigned_envelope(signer_identity, sig_alg, receipt_id, method, path, ops, body, ttl_seconds=300, delegating=False)` | `UnsignedEnvelope` | For relay/external signing |
+| `build_signed_envelope(signer, receipt_id, method, path, query="", ops, body, ttl_seconds=300, delegating=False)` | `SignedEnvelope` | Create signed auth headers |
+| `build_unsigned_envelope(signer_identity, sig_alg, receipt_id, method, path, query="", ops, body, ttl_seconds=300, delegating=False)` | `UnsignedEnvelope` | For relay/external signing |
 | `attach_signature(unsigned, signature)` | `SignedEnvelope` | Attach signature to unsigned envelope |
 | `compute_locker_id(receipt_id)` | `str` | Deterministic locker ID: `"locker_" + sha256(receipt_id)[:12]` |
 
@@ -810,6 +810,9 @@ signed = attach_signature(unsigned, signature)
 
 The signed envelope includes:
 - Request method and path
+- `query` — the request query string, bound by the gateway when the
+  endpoint carries its arguments there (e.g. `POST /v1/storage/attest`).
+  Optional; omitted for body-only endpoints.
 - `body_sha256` hash for POST requests
 - Timestamp with TTL (default 5 minutes, prevents replay)
 - Signer's public key and algorithm
