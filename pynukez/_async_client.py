@@ -2288,9 +2288,26 @@ class AsyncNukez:
         if sync:
             params["sync"] = "true"
 
+        # /v1/storage/attest is a signed endpoint (ops=["locker:attest"]). Its
+        # arguments travel in the query string, so the envelope must bind that
+        # query string — see build_signed_envelope's `query` parameter.
+        signer = self._require_signer("attest", receipt_id)
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="POST",
+            path="/v1/storage/attest",
+            query=urlencode(params),
+            ops=["locker:attest"],
+            body={},
+            delegating=self._is_delegating(receipt_id),
+        )
+
         response = await self.http.post(
             "/v1/storage/attest",
+            headers=envelope.headers,
             params=params,
+            content=envelope.canonical_body.encode("utf-8"),
         )
 
         push_result = response.get("push_result") or {}

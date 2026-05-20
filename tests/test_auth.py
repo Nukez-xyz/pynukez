@@ -245,6 +245,32 @@ class TestBuildSignedEnvelopeGeneralized:
         decoded = self._decode_envelope(env)
         assert "sig_alg" in decoded
 
+    def test_query_included_when_set(self, keypair):
+        """A non-empty query string is bound into the envelope."""
+        env = build_signed_envelope(
+            signer=keypair,
+            receipt_id="test_rid",
+            method="POST",
+            path="/v1/storage/attest",
+            query="receipt_id=test_rid&sync=true",
+            ops=["locker:attest"],
+            body={},
+        )
+        decoded = self._decode_envelope(env)
+        assert decoded["query"] == "receipt_id=test_rid&sync=true"
+
+    def test_query_omitted_when_empty(self, keypair):
+        """No query field is emitted when query is empty (default)."""
+        env = build_signed_envelope(
+            signer=keypair,
+            receipt_id="test_rid",
+            method="GET",
+            path="/v1/lockers/locker_test/files",
+            ops=["locker:list"],
+        )
+        decoded = self._decode_envelope(env)
+        assert "query" not in decoded
+
 
 class TestBuildUnsignedEnvelope:
     """Unsigned envelope construction for relay/external signing."""
@@ -396,6 +422,32 @@ class TestBuildUnsignedEnvelope:
         )
         assert env.locker_id == compute_locker_id("test_rid")
         assert env.envelope["locker_id"] == compute_locker_id("test_rid")
+
+    def test_query_included_when_set(self):
+        """A non-empty query string is bound into the unsigned envelope."""
+        env = build_unsigned_envelope(
+            signer_identity="FakePubkey123",
+            sig_alg="ed25519",
+            receipt_id="test_rid",
+            method="POST",
+            path="/v1/storage/attest",
+            query="receipt_id=test_rid&sync=true",
+            ops=["locker:attest"],
+            body={},
+        )
+        assert env.envelope["query"] == "receipt_id=test_rid&sync=true"
+
+    def test_query_omitted_when_empty(self):
+        """No query field is emitted when query is empty (default)."""
+        env = build_unsigned_envelope(
+            signer_identity="FakePubkey123",
+            sig_alg="ed25519",
+            receipt_id="test_rid",
+            method="GET",
+            path="/v1/test",
+            ops=[],
+        )
+        assert "query" not in env.envelope
 
 
 class TestAttachSignature:

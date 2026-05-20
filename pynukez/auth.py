@@ -227,6 +227,7 @@ def build_signed_envelope(
     receipt_id: str = "",
     method: str = "",
     path: str = "",
+    query: str = "",
     ops: List[str] = None,
     body: Optional[Union[Dict, str]] = None,
     ttl_seconds: int = 300,
@@ -246,6 +247,10 @@ def build_signed_envelope(
         receipt_id: Receipt ID from confirm_storage()
         method: HTTP method (GET, POST, PUT, DELETE)
         path: API path (e.g., "/v1/lockers/{id}/files")
+        query: Raw request query string (e.g. "receipt_id=abc&sync=true").
+            Required for endpoints whose arguments live in the query string
+            (e.g. POST /v1/storage/attest) — the gateway binds the envelope
+            to it. Omit (default "") for body-only endpoints.
         ops: Required operations (e.g., ["locker:write"])
         body: Request body dict for POST/PUT (will be canonicalized)
         ttl_seconds: Envelope validity duration (default 5 minutes)
@@ -340,6 +345,14 @@ def build_signed_envelope(
     if delegating:
         envelope["signer"] = signer.identity
 
+    # Bind the envelope to the request query string when present. The gateway
+    # canonicalizes (parse_qsl -> sort -> urlencode) both sides and rejects a
+    # mismatch (ENVELOPE_QUERY_MISMATCH). Endpoints that carry their arguments
+    # in the query string -- notably POST /v1/storage/attest -- require this;
+    # body-only endpoints omit it (the gateway reads an absent query as "").
+    if query:
+        envelope["query"] = query
+
     # Canonicalize envelope for signing - MUST use exact same pattern
     envelope_json = json.dumps(envelope, separators=(',', ':'), sort_keys=True)
 
@@ -370,6 +383,7 @@ def build_unsigned_envelope(
     receipt_id: str = "",
     method: str = "",
     path: str = "",
+    query: str = "",
     ops: List[str] = None,
     body: Optional[Union[Dict, str]] = None,
     ttl_seconds: int = 300,
@@ -390,6 +404,9 @@ def build_unsigned_envelope(
         receipt_id: Receipt ID from confirm_storage().
         method: HTTP method (GET, POST, PUT, DELETE).
         path: API path (e.g., "/v1/lockers/{id}/files").
+        query: Raw request query string (e.g. "receipt_id=abc&sync=true").
+            Bound by the gateway for query-arg endpoints; omit for
+            body-only endpoints.
         ops: Required operations (e.g., ["locker:write"]).
         body: Request body dict for POST/PUT (will be canonicalized).
         ttl_seconds: Envelope validity duration (default 5 minutes).
@@ -452,6 +469,10 @@ def build_unsigned_envelope(
 
     if delegating:
         envelope["signer"] = signer_identity
+
+    # See build_signed_envelope: bind the query string when present.
+    if query:
+        envelope["query"] = query
 
     envelope_json = json.dumps(envelope, separators=(',', ':'), sort_keys=True)
     envelope_b64 = base64.urlsafe_b64encode(
