@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from urllib.parse import urlencode
 from .types import (
     StorageRequest,
+    SplTransfer,
     Receipt,
     NukezManifest,
     FileUrls,
@@ -575,10 +576,28 @@ class Nukez:
         Returns:
             StorageRequest with payment instructions:
             - pay_req_id: Save this for confirm_storage()
-            - pay_to_address: Address to send payment (Solana pubkey or 0x address)
+            - pay_to_address: Destination for the payment. Semantics depend
+              on the asset — check `destination_kind`:
+                * "wallet"            → native SOL / EVM wallet pubkey;
+                  send value directly.
+                * "spl_token_account" → Solana SPL (USDC/USDT/WETH/BETA):
+                  this IS the treasury's SPL token account; pass it
+                  directly as the transferChecked destination — do NOT
+                  call get_associated_token_address. Read mint, amount_raw,
+                  decimals from `spl_transfer`.
+                * "evm_address"       → EVM rails: a wallet/EOA. ERC-20
+                  transfers call `transfer(pay_to_address, amount)` on
+                  `token_address`.
+                * None / "unknown"    → older gateway / unspecified; the
+                  SDK falls back to native-wallet interpretation.
+              The field name is preserved for back-compat; `destination_kind`
+              is the authoritative semantic.
+            - destination_kind / spl_transfer: see above (additive,
+              optional; None on older gateways).
             - amount_sol / amount_lamports: Populated for Solana quotes
             - amount / amount_raw / token_address / token_decimals:
-              Populated for EVM quotes
+              Populated for EVM quotes. `token_address` is NOT set for
+              Solana SPL — read `spl_transfer.mint` instead.
             - pay_asset: Token symbol ("SOL", "USDC", "MON", "USDT0", etc.)
             - network: Payment network identifier (friendly form, converted
               from the 402 response's CAIP-2 string via caip2_to_friendly)
@@ -642,6 +661,9 @@ class Nukez:
                 idempotency_key=e.details.get("idempotency_key"),
                 terms=e.terms,
                 price_breakdown=e.details.get("price_breakdown"),
+                # Destination disambiguation (typed; None on older gateways).
+                destination_kind=e.destination_kind,
+                spl_transfer=e.spl_transfer,
             )
 
             # If the caller requested a specific chain/asset, override the
@@ -670,6 +692,10 @@ class Nukez:
                     request.amount_raw = int(opt["amount"]) if opt.get("amount") else None
                     request.token_address = opt.get("asset_contract") if opt.get("asset_contract") not in (None, "native") else None
                     request.token_decimals = opt.get("decimals")
+                    # Destination disambiguation — convert the raw-dict view to
+                    # the typed SplTransfer so request.spl_transfer is type-correct.
+                    request.destination_kind = opt.get("destination_kind")
+                    request.spl_transfer = SplTransfer.from_dict(opt.get("spl_transfer"))
                     if opt.get("human_amount"):
                         try:
                             request.amount_sol = float(opt["human_amount"])

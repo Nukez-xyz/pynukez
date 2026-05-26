@@ -31,10 +31,11 @@ from .errors import (
     OperatorNotFoundError,
     OperatorConflictError,
 )
+from .types import SplTransfer
 
 # Standard headers shared by sync and async clients
 STANDARD_HEADERS = {
-    "User-Agent": "nukez-sdk/4.0.17",
+    "User-Agent": "nukez-sdk/4.0.18",
     "Accept": "application/json",
     "Content-Type": "application/json",
 }
@@ -180,7 +181,17 @@ def handle_error_response(response) -> None:
             payment_options, quote_expires_at, terms = [], None, None
             quote_schema, idempotency_key, price_breakdown = None, None, None
 
-            # Build payment_options from all accepts entries
+            # Build payment_options from all accepts entries.
+            #
+            # CONTRACT: `entry` stays a plain dict of primitives (incl.
+            # nested raw-dict spl_transfer). This is the "dict view" that
+            # external consumers — notably nukez-mcp's preflight at
+            # nukez_mcp/tools/_preflight.py — read via .get(). Do NOT
+            # convert spl_transfer to an SplTransfer instance here; the
+            # typed view lives on PaymentOption.spl_transfer (via
+            # parsed_options) and StorageRequest.spl_transfer. Test
+            # `test_payment_destination_kind.py::test_raw_payment_options_*`
+            # pins this with an explicit isinstance(..., dict) assertion.
             for opt in accepts:
                 extra = opt.get("extra", {})
                 entry = {
@@ -191,6 +202,10 @@ def handle_error_response(response) -> None:
                     "decimals": extra.get("decimals", 0),
                     "human_amount": extra.get("human_amount", ""),
                     "asset_contract": opt.get("asset", ""),
+                    # Destination disambiguation — additive, back-compat.
+                    # Older gateways omit these fields; .get() yields None.
+                    "destination_kind": extra.get("destination_kind"),
+                    "spl_transfer": extra.get("spl_transfer"),  # raw dict, see CONTRACT above
                 }
                 payment_options.append(entry)
 
@@ -225,6 +240,10 @@ def handle_error_response(response) -> None:
             asset_contract = selected.get("asset", "")
             is_native = asset_contract in ("native", "So11111111111111111111111111111111111111112")
 
+            # Destination disambiguation from the selected option.
+            destination_kind = extra.get("destination_kind")
+            spl_transfer = SplTransfer.from_dict(extra.get("spl_transfer"))
+
             if "solana" in network:
                 if token_decimals:
                     amount_sol = float(int(amount)) / (10 ** token_decimals)
@@ -232,6 +251,11 @@ def handle_error_response(response) -> None:
                     amount_sol = float(int(amount)) / 1_000_000_000
                 amount_lamports = int(amount)
                 amount_raw = int(amount)
+                # NOTE: token_address is intentionally NOT set for Solana SPL.
+                # For SPL the mint lives on `spl_transfer.mint`. Backfilling
+                # token_address from asset_contract here would silently change
+                # semantics for existing callers that treat token_address as
+                # EVM-only. If you need the mint, read spl_transfer.mint.
             else:
                 amount_raw = int(amount)
                 if not is_native:
@@ -251,6 +275,8 @@ def handle_error_response(response) -> None:
                 payment_options=payment_options,
                 quote_expires_at=quote_expires_at,
                 terms=terms,
+                destination_kind=destination_kind,
+                spl_transfer=spl_transfer,
             )
             if price_breakdown:
                 err.details["price_breakdown"] = price_breakdown

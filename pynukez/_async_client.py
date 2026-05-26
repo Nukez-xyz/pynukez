@@ -37,6 +37,7 @@ from urllib.parse import urlencode
 
 from .types import (
     StorageRequest,
+    SplTransfer,
     Receipt,
     NukezManifest,
     FileUrls,
@@ -592,6 +593,9 @@ class AsyncNukez:
                 idempotency_key=e.details.get("idempotency_key"),
                 terms=e.terms,
                 price_breakdown=e.details.get("price_breakdown"),
+                # Destination disambiguation (typed; None on older gateways).
+                destination_kind=e.destination_kind,
+                spl_transfer=e.spl_transfer,
             )
 
             # If the caller requested a specific chain/asset, override the
@@ -620,6 +624,10 @@ class AsyncNukez:
                     request.amount_raw = int(opt["amount"]) if opt.get("amount") else None
                     request.token_address = opt.get("asset_contract") if opt.get("asset_contract") not in (None, "native") else None
                     request.token_decimals = opt.get("decimals")
+                    # Destination disambiguation — convert the raw-dict view to
+                    # the typed SplTransfer so request.spl_transfer is type-correct.
+                    request.destination_kind = opt.get("destination_kind")
+                    request.spl_transfer = SplTransfer.from_dict(opt.get("spl_transfer"))
                     if opt.get("human_amount"):
                         try:
                             request.amount_sol = float(opt["human_amount"])

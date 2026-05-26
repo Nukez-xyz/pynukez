@@ -11,6 +11,11 @@ Design Philosophy:
 - Details dict provides structured error information
 """
 
+from dataclasses import asdict
+from typing import Optional
+
+from .types import SplTransfer
+
 
 class NukezError(Exception):
     """
@@ -57,15 +62,37 @@ class PaymentRequiredError(NukezError):
 
     Attributes:
         pay_req_id: Payment request ID (save for confirm_storage)
-        pay_to_address: Address to send payment (Solana pubkey or 0x EVM address)
+        pay_to_address: Destination for the payment. Semantics depend on the
+            asset — check ``destination_kind`` to be sure:
+              * ``"wallet"``            — native SOL or EVM wallet pubkey.
+                Send value directly.
+              * ``"spl_token_account"`` — Solana SPL (USDC/USDT/WETH/BETA):
+                this IS the treasury's SPL token account. Use it directly
+                as the transferChecked destination; do NOT call
+                ``get_associated_token_address`` on it. The mint, raw amount,
+                and decimals live on ``spl_transfer``.
+              * ``"evm_address"``       — EVM rails: a wallet/EOA. For ERC-20
+                the transfer goes to the contract at ``token_address`` with
+                ``pay_to_address`` as the recipient argument.
+              * ``"unknown"`` / ``None`` — older gateway or unspecified;
+                the SDK treats it as if absent (fall back to native wallet
+                interpretation).
+            The field name is preserved for backward compatibility —
+            ``destination_kind`` is the authoritative semantic.
         amount_sol: Amount in SOL (Solana payments)
         amount_lamports: Amount in lamports (Solana payments)
         network: Payment network identifier
-        pay_asset: Token symbol ("SOL", "USDC", "USDT", "MON", "WETH")
+        pay_asset: Token symbol ("SOL", "USDC", "USDT", "MON", "WETH", "BETA")
         amount: Human-readable amount string (EVM payments)
         amount_raw: Atomic units as integer (EVM payments)
-        token_address: ERC-20 contract address (EVM payments)
+        token_address: ERC-20 contract address (EVM payments). NOT set for
+            Solana SPL — read ``spl_transfer.mint`` instead.
         token_decimals: Token decimal places (EVM payments)
+        destination_kind: See ``pay_to_address`` above. Optional / additive.
+        spl_transfer: Self-contained SPL transferChecked description
+            (``SplTransfer``: ``program_id``, ``destination_token_account``,
+            ``mint``, ``amount_raw``, ``decimals``). Present only when
+            ``destination_kind == "spl_token_account"``.
     """
 
     def __init__(
@@ -85,6 +112,9 @@ class PaymentRequiredError(NukezError):
         payment_options: list = None,
         quote_expires_at: int = None,
         terms: dict = None,
+        # Destination disambiguation — additive, back-compat (None defaults).
+        destination_kind: Optional[str] = None,
+        spl_transfer: Optional[SplTransfer] = None,
     ):
         is_evm = any(tag in (network or "") for tag in ("monad", "ethereum", "evm", "arbitrum"))
         if is_evm and amount:
@@ -119,6 +149,13 @@ class PaymentRequiredError(NukezError):
             details["quote_expires_at"] = quote_expires_at
         if terms:
             details["terms"] = terms
+        # Destination disambiguation — store the dict form in `details` for
+        # JSON-friendliness (matches the rest of the dict), and the typed
+        # dataclass on the attribute for ergonomic access.
+        if destination_kind:
+            details["destination_kind"] = destination_kind
+        if spl_transfer is not None:
+            details["spl_transfer"] = asdict(spl_transfer)
         super().__init__(message, details=details)
         self.pay_req_id = pay_req_id
         self.pay_to_address = pay_to_address
@@ -133,6 +170,8 @@ class PaymentRequiredError(NukezError):
         self.payment_options = payment_options
         self.quote_expires_at = quote_expires_at
         self.terms = terms
+        self.destination_kind = destination_kind
+        self.spl_transfer = spl_transfer
         self.retryable = False  # Need to pay first
 
 

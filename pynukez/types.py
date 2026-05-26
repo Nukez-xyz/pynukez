@@ -10,6 +10,40 @@ from decimal import Decimal
 from typing import List, Optional, Dict, Any, Tuple
 import hashlib
 
+
+@dataclass(frozen=True)
+class SplTransfer:
+    """Self-contained Solana SPL transferChecked description.
+
+    Present on payment options whose ``destination_kind == "spl_token_account"``.
+    ``destination_token_account`` IS the treasury's SPL token account — pass it
+    directly as the transferChecked destination; do NOT call
+    ``get_associated_token_address`` on it.
+    """
+    program_id: str
+    destination_token_account: str
+    mint: str
+    amount_raw: int
+    decimals: int
+
+    @classmethod
+    def from_dict(cls, d: Optional[Dict[str, Any]]) -> Optional["SplTransfer"]:
+        """Construct from a raw dict, or return None if ``d`` is None/empty.
+
+        Tolerant of missing keys — defaults to empty/zero so a malformed
+        gateway response doesn't blow up parsing of the surrounding payment.
+        """
+        if not d:
+            return None
+        return cls(
+            program_id=d.get("program_id", ""),
+            destination_token_account=d.get("destination_token_account", ""),
+            mint=d.get("mint", ""),
+            amount_raw=int(d.get("amount_raw", 0) or 0),
+            decimals=int(d.get("decimals", 0) or 0),
+        )
+
+
 @dataclass
 class StorageRequest:
     """Payment instructions from request_storage().
@@ -30,11 +64,25 @@ class StorageRequest:
     pay_asset: str = "SOL"
     amount: Optional[str] = None          # human-readable amount (all chains)
     amount_raw: Optional[int] = None      # atomic units (lamports / wei / token units)
-    token_address: Optional[str] = None   # ERC-20 contract address (EVM only)
+    token_address: Optional[str] = None   # ERC-20 contract address (EVM only — NOT set for Solana SPL; read spl_transfer.mint instead)
     token_decimals: Optional[int] = None  # token decimals (EVM only)
 
+    # Destination disambiguation (additive, back-compat).
+    # destination_kind tells the caller what pay_to_address means:
+    #   "wallet"            — native SOL or EVM wallet: send value directly.
+    #   "spl_token_account" — Solana SPL (USDC/USDT/WETH/BETA): pay_to_address
+    #                         IS the treasury's SPL token account; pass it as the
+    #                         transferChecked destination, do NOT derive an ATA.
+    #                         The mint/amount_raw/decimals live on spl_transfer.
+    #   "evm_address"       — EVM rails: a wallet/EOA. For ERC-20 the transfer
+    #                         goes to the contract at token_address with
+    #                         pay_to_address as the recipient argument.
+    #   "unknown" / None    — older gateway or unspecified: treat as native wallet.
+    destination_kind: Optional[str] = None
+    spl_transfer: Optional[SplTransfer] = None
+
     # Quote lifecycle (from 402 response)
-    payment_options: Optional[List[Dict[str, Any]]] = None   # all chain/asset combos; use parsed_options for typed access
+    payment_options: Optional[List[Dict[str, Any]]] = None   # all chain/asset combos as raw dicts (the dict view nukez-mcp's preflight reads); use parsed_options for typed access
     quote_expires_at: Optional[int] = None                    # unix timestamp
     quote_schema: Optional[str] = None                        # "dl_quote_v3"
     idempotency_key: Optional[str] = None
@@ -52,7 +100,22 @@ class StorageRequest:
         return any(tag in (self.network or "") for tag in ("monad", "ethereum", "evm", "arbitrum"))
 
     def __post_init__(self):
-        if self.is_evm:
+        if self.destination_kind == "spl_token_account":
+            # Solana SPL — explicit instructions so the caller doesn't derive an ATA.
+            sf = self.spl_transfer
+            mint = sf.mint if sf else "?"
+            amt = sf.amount_raw if sf else (self.amount_raw if self.amount_raw is not None else "?")
+            dec = sf.decimals if sf else (self.token_decimals if self.token_decimals is not None else "?")
+            self.next_step = (
+                f"Solana SPL ({self.pay_asset}): pay_to_address ({self.pay_to_address}) "
+                f"IS the treasury's SPL token account — pass it directly as the "
+                f"transferChecked destination, do NOT call get_associated_token_address. "
+                f"Use mint={mint}, amount_raw={amt}, decimals={dec}. Then call "
+                f"confirm_storage(pay_req_id='{self.pay_req_id}', "
+                f"tx_sig=<your_tx_signature>, payment_chain='{self.network}', "
+                f"payment_asset='{self.pay_asset}')"
+            )
+        elif self.is_evm:
             self.next_step = (
                 f"Transfer {self.amount or '?'} {self.pay_asset} "
                 f"to {self.pay_to_address} on {self.network}, then call "
@@ -237,6 +300,9 @@ class PaymentOption:
     decimals: int           # token decimals
     token_contract: Optional[str] = None   # ERC-20 address (EVM only)
     oracle_rate: Optional[Dict[str, Any]] = None  # e.g. {"mon_usd": 0.42, "source": "coingecko"}
+    # See StorageRequest.destination_kind for the full vocabulary.
+    destination_kind: Optional[str] = None
+    spl_transfer: Optional[SplTransfer] = None
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "PaymentOption":
@@ -250,6 +316,8 @@ class PaymentOption:
             decimals=d["decimals"],
             token_contract=d.get("token_contract"),
             oracle_rate=d.get("oracle_rate"),
+            destination_kind=d.get("destination_kind"),
+            spl_transfer=SplTransfer.from_dict(d.get("spl_transfer")),
         )
 
 @dataclass
