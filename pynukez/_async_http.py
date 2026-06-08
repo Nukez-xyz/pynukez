@@ -23,9 +23,14 @@ class AsyncHTTPClient:
     Mirrors HTTPClient's interface exactly — only the transport is async.
     Shares all error-handling and response-parsing logic via _http.py
     module-level functions.
+
+    The default timeout (120s) matches AsyncNukez's effective default — see
+    AsyncNukez.__init__'s ``self.timeout = timeout or 120``. Per-call
+    overrides are supported by passing ``timeout=`` through ``post()`` /
+    ``get()`` / ``put()`` / ``delete()``.
     """
 
-    def __init__(self, base_url: str, timeout: int = 30):
+    def __init__(self, base_url: str, timeout: int = 120):
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.client = httpx.AsyncClient(
@@ -48,9 +53,10 @@ class AsyncHTTPClient:
         self,
         path: str,
         params: dict = None,
-        headers: dict = None
+        headers: dict = None,
+        **kwargs,
     ) -> Dict[str, Any]:
-        """Execute async GET request."""
+        """Execute async GET request. Extra kwargs (e.g. ``timeout=``) flow to httpx."""
         url = f"{self.base_url}{path}"
 
         try:
@@ -58,6 +64,7 @@ class AsyncHTTPClient:
                 url,
                 params=params,
                 headers=headers or {},
+                **kwargs,
             )
         except httpx.TimeoutException:
             raise NukezError(f"Request timed out after {self.timeout}s: GET {path}")

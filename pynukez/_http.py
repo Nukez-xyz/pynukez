@@ -35,7 +35,7 @@ from .types import SplTransfer
 
 # Standard headers shared by sync and async clients
 STANDARD_HEADERS = {
-    "User-Agent": "nukez-sdk/4.0.18",
+    "User-Agent": "nukez-sdk/4.0.19",
     "Accept": "application/json",
     "Content-Type": "application/json",
 }
@@ -425,9 +425,14 @@ class HTTPClient:
 
     Converts HTTP error responses into appropriate Nukez exceptions
     with actionable error messages for agents.
+
+    The default timeout (120s) matches Nukez's effective default — see
+    Nukez.__init__'s ``self.timeout = timeout or 120``. Per-call overrides
+    are supported by passing ``timeout=`` through ``post()`` / ``get()`` /
+    ``put()`` / ``delete()`` (httpx honors per-request timeout overrides).
     """
 
-    def __init__(self, base_url: str, timeout: int = 30):
+    def __init__(self, base_url: str, timeout: int = 120):
         self.base_url = base_url.rstrip('/')
         self.timeout = timeout
         self.client = httpx.Client(
@@ -450,9 +455,10 @@ class HTTPClient:
         self,
         path: str,
         params: dict = None,
-        headers: dict = None
+        headers: dict = None,
+        **kwargs,
     ) -> Dict[str, Any]:
-        """Execute GET request."""
+        """Execute GET request. Extra kwargs (e.g. ``timeout=``) flow to httpx."""
         url = f"{self.base_url}{path}"
 
         try:
@@ -460,6 +466,7 @@ class HTTPClient:
                 url,
                 params=params,
                 headers=headers or {},
+                **kwargs,
             )
         except httpx.TimeoutException:
             raise NukezError(f"Request timed out after {self.timeout}s: GET {path}")

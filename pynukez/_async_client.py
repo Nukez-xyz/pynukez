@@ -45,6 +45,7 @@ from .types import (
     UploadResult,
     DeleteResult,
     VerificationResult,
+    RecomputeVerifyResult,
     ReceiptHashVerification,
     PriceInfo,
     ConfirmResult,
@@ -2203,30 +2204,82 @@ class AsyncNukez:
             params={"receipt_id": receipt_id, "filename": filename},
         )
 
+    async def recompute_verify(
+        self,
+        receipt_id: str,
+        timeout: Optional[int] = None,
+    ) -> RecomputeVerifyResult:
+        """Re-download every file from storage and recompute hashes.
+
+        Use when you need cryptographic proof that storage bytes still match
+        the recorded hashes. Latency scales with total locker bytes. For a
+        fast structural check, use ``verify_storage()`` or ``attest()``
+        instead — those trust the manifest's recorded content_hash and run
+        in seconds independent of locker size.
+
+        Gateway endpoint: ``GET /v1/storage/recompute-verify?receipt_id=...``.
+        Public-by-receipt_id — no signed envelope required.
+
+        Args:
+            receipt_id: Receipt ID from confirm_storage().
+            timeout: Optional per-call timeout (seconds). Defaults to the
+                client's effective timeout (120s); raise for sizeable
+                content where the recompute may exceed the default.
+
+        Returns:
+            RecomputeVerifyResult with ``match``, ``computed``, ``stored``,
+            ``file_count``, ``recompute_ms``, and the full response under
+            ``details``.
+        """
+        kwargs: Dict[str, Any] = {"params": {"receipt_id": receipt_id}}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        response = await self.http.get("/v1/storage/recompute-verify", **kwargs)
+        return RecomputeVerifyResult(
+            receipt_id=receipt_id,
+            match=bool(response.get("match", False)),
+            computed=str(response.get("computed", "")),
+            stored=str(response.get("stored", "")),
+            file_count=int(response.get("file_count", 0) or 0),
+            recompute_ms=int(response.get("recompute_ms", 0) or 0),
+            details=response,
+        )
+
     async def _post_confirm(
         self,
         confirm_url: Optional[str],
         fallback_path: str,
         fallback_params: Dict[str, Any],
+        timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         POST to a confirm endpoint. Prefers the absolute confirm_url returned
         by create_file/create_files_batch; falls back to the hardcoded path.
 
         Gateway confirm routes are public-by-receipt_id — no envelope required.
+
+        Args:
+            confirm_url: Absolute confirm URL from create_file()/create_files_batch().
+            fallback_path: Hardcoded path used when confirm_url is unset.
+            fallback_params: Query params for the fallback path.
+            timeout: Per-call timeout (seconds). Defaults to self.timeout.
         """
+        eff_timeout = timeout if timeout is not None else self.timeout
         if confirm_url:
             try:
-                resp = await self._raw_client.post(confirm_url, timeout=self.timeout)
+                resp = await self._raw_client.post(confirm_url, timeout=eff_timeout)
                 if resp.status_code >= 400:
                     from ._http import handle_error_response
                     handle_error_response(resp)
                 return resp.json()
             except _httpx.TimeoutException:
-                raise NukezError(f"Request timed out after {self.timeout}s: POST confirm")
+                raise NukezError(f"Request timed out after {eff_timeout}s: POST confirm")
             except _httpx.HTTPError as e:
                 raise NukezError(f"Request failed: POST confirm: {e}")
-        return await self.http.post(fallback_path, params=fallback_params)
+        post_kwargs: Dict[str, Any] = {"params": fallback_params}
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+        return await self.http.post(fallback_path, **post_kwargs)
 
     async def confirm_file(
         self,
@@ -2260,19 +2313,27 @@ class AsyncNukez:
         receipt_id: str,
         filenames: List[str],
         confirm_batch_url: Optional[str] = None,
+        timeout: Optional[int] = None,
     ) -> BatchConfirmResult:
         """Confirm multiple file uploads in a single operation.
+
+        Post-Patch-2, a batch confirm produces a single auto-reattest cycle
+        rather than N independent on-chain pushes — far more efficient than
+        calling confirm_file() in a loop.
 
         Args:
             receipt_id: Receipt ID from confirm_storage()
             filenames: List of filenames to confirm
             confirm_batch_url: Optional absolute confirm URL from
                 create_files_batch() response.
+            timeout: Optional per-call timeout (seconds). Defaults to the
+                client's effective timeout (120s).
         """
         response = await self._post_confirm(
             confirm_batch_url,
             "/v1/files/confirm-batch",
             {"receipt_id": receipt_id, "filenames": filenames},
+            timeout=timeout,
         )
 
         results = []
@@ -2290,8 +2351,33 @@ class AsyncNukez:
             failed_count=response.get("failed", len([r for r in results if not r.confirmed])),
         )
 
-    async def attest(self, receipt_id: str, sync: bool = True) -> AttestResult:
-        """Trigger attestation -- compute merkle root and optionally push on-chain."""
+    async def attest(
+        self,
+        receipt_id: str,
+        sync: bool = True,
+        timeout: Optional[int] = None,
+    ) -> AttestResult:
+        """Trigger attestation — compute merkle root and optionally push on-chain.
+
+        The gateway no longer re-downloads file bytes on every attestation;
+        it trusts the manifest's recorded content_hash. Latency is bounded by
+        the on-chain Switchboard confirmation (~5-10s typical), not by locker
+        size. For byte-level proof that the persisted hashes still match
+        storage contents, call ``recompute_verify()`` instead — that path
+        re-downloads everything and latency scales with locker bytes.
+
+        Auth: signed envelope, ``ops=["locker:attest"]``. The SDK builds the
+        envelope (with the query string bound) and adds the headers.
+
+        Args:
+            receipt_id: Receipt ID from confirm_storage().
+            sync: If True (default), wait for attestation to complete. If
+                False, returns immediately with status="accepted" — poll
+                ``verify_storage()`` for a truthy ``merkle_root`` (or use
+                ``attest_async()`` to do the polling for you).
+            timeout: Optional per-call timeout (seconds). Defaults to the
+                client's effective timeout (120s).
+        """
         params = {"receipt_id": receipt_id}
         if sync:
             params["sync"] = "true"
@@ -2311,12 +2397,14 @@ class AsyncNukez:
             delegating=self._is_delegating(receipt_id),
         )
 
-        response = await self.http.post(
-            "/v1/storage/attest",
-            headers=envelope.headers,
-            params=params,
-            content=envelope.canonical_body.encode("utf-8"),
-        )
+        post_kwargs: Dict[str, Any] = {
+            "headers": envelope.headers,
+            "params": params,
+            "content": envelope.canonical_body.encode("utf-8"),
+        }
+        if timeout is not None:
+            post_kwargs["timeout"] = timeout
+        response = await self.http.post("/v1/storage/attest", **post_kwargs)
 
         push_result = response.get("push_result") or {}
 
@@ -2329,6 +2417,69 @@ class AsyncNukez:
             push_ok=push_result.get("ok", False),
             tx_signature=push_result.get("tx_signature"),
             switchboard_slot=push_result.get("slot"),
+        )
+
+    async def attest_async(
+        self,
+        receipt_id: str,
+        poll_interval: float = 1.0,
+        max_wait: float = 60.0,
+    ) -> AttestResult:
+        """Trigger attestation asynchronously and poll until merkle_root appears.
+
+        Calls ``attest(sync=False)`` (which enqueues a Cloud Tasks job and
+        returns 202), then polls ``verify_storage()`` until a truthy
+        ``merkle_root`` shows up — the authoritative completion signal. The
+        status string transitions through pending → computed → pushing →
+        complete and is informational only; do not gate completion on it.
+
+        Cloud Tasks dedup window is 5 seconds: two ``attest_async()`` calls
+        within 5 sec for the same receipt collapse to a single on-chain push,
+        saving a Switchboard fee for back-to-back batch workflows.
+
+        Args:
+            receipt_id: Receipt ID from confirm_storage().
+            poll_interval: Seconds between verify_storage() polls.
+            max_wait: Total seconds to wait before raising
+                ``NukezError("attest_timeout")``.
+
+        Returns:
+            AttestResult mirroring ``attest(sync=True)``'s shape. Note that
+            ``tx_signature`` and ``switchboard_slot`` may be ``None`` here
+            even when ``merkle_root`` is populated — call
+            ``verify_storage()`` again after settlement to pick them up.
+
+        Raises:
+            NukezError("attest_timeout: ..."): max_wait exceeded with no
+                merkle_root.
+        """
+        await self.attest(receipt_id, sync=False)
+
+        deadline = time.time() + max_wait
+        while time.time() < deadline:
+            v = await self.verify_storage(receipt_id)
+            if v.merkle_root:
+                att_code_int: Optional[int] = None
+                if v.att_code and str(v.att_code).strip().lstrip("-").isdigit():
+                    att_code_int = int(v.att_code)
+                return AttestResult(
+                    receipt_id=receipt_id,
+                    merkle_root=v.merkle_root,
+                    file_count=v.file_count,
+                    att_code=att_code_int,
+                    status="complete",
+                    push_ok=bool(v.att_code),
+                    tx_signature=None,
+                    switchboard_slot=None,
+                )
+            await asyncio.sleep(poll_interval)
+
+        raise NukezError(
+            f"attest_timeout: receipt '{receipt_id}' did not produce a "
+            f"merkle_root within {max_wait}s. Continue polling "
+            f"verify_storage() manually, or retry attest_async() to "
+            f"re-enqueue (within the 5s Cloud Tasks dedup window two "
+            f"attempts collapse to one on-chain push)."
         )
 
     # ------------------------------------------------------------------

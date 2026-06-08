@@ -540,3 +540,35 @@ class LockerRecord:
     provider: str
     created_at: Optional[str] = None
     tags: Optional[List[str]] = None
+
+
+@dataclass
+class RecomputeVerifyResult:
+    """Byte-level recompute-verify result from recompute_verify().
+
+    This is the "expensive proof" path — the gateway re-downloads every file
+    from storage and recomputes hashes, returning whether the freshly-computed
+    digest matches the stored merkle root.
+
+    Use when you need cryptographic proof that storage bytes still match the
+    recorded hashes. For a fast structural check (no re-download), use
+    verify_storage() or attest() instead — those trust the manifest's
+    recorded content_hash. recompute_verify is the honest "prove the bytes
+    still match" path; its latency scales with total locker bytes.
+
+    Attributes:
+        receipt_id: Receipt the verification was scoped to.
+        match: True iff the recomputed digest matches the stored merkle root.
+        computed: SHA256 the gateway recomputed by re-downloading files.
+        stored: SHA256 the gateway had on record before the recompute.
+        file_count: Number of files re-downloaded and hashed.
+        recompute_ms: Wall-clock milliseconds the gateway spent on the recompute.
+        details: Full response dict for any fields not surfaced as attributes.
+    """
+    receipt_id: str
+    match: bool
+    computed: str = ""
+    stored: str = ""
+    file_count: int = 0
+    recompute_ms: int = 0
+    details: Optional[Dict[str, Any]] = None
