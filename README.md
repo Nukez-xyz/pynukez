@@ -247,15 +247,12 @@ instead.
 
 ---
 
-## Selecting Devnet Or Mainnet
+## Network
 
-Choose the target network explicitly when constructing the client:
+Nukez is mainnet-only in production. Construct the client with the
+production network value:
 
 ```python
-# Devnet (testing)
-client = Nukez(keypair_path="~/.config/solana/id.json", network="devnet")
-
-# Mainnet (production)
 client = Nukez(keypair_path="~/.config/solana/id.json", network="mainnet-beta")
 ```
 
