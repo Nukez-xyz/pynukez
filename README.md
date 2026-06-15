@@ -45,8 +45,11 @@ request = client.request_storage(units=1, provider="gcs")
 
 # Print details for next step
 print(request.next_step)
-# -> "Transfer 0.001 SOL to <addr> on solana-devnet,
+# -> "Transfer 0.235 SOL to <addr> on solana-mainnet,
 #     then call confirm_storage(pay_req_id='...', tx_sig=<your_tx_signature>)"
+# (Amount/asset/chain are quote-driven — they vary with the live price and
+#  the pay_asset/pay_network you request. SOL, USDC, USDT, WETH, MON, BETA
+#  are all selectable; see request.payment_options for the full menu.)
 
 # Using the x402 payment details assigned to the request variable
 # Complete transfer via preferred method
@@ -115,12 +118,16 @@ async with AsyncNukez(
 | Batch upload | `client.bulk_upload_paths(receipt.id, [{"filepath": "a.pdf"}, {"filepath": "b.txt"}])` |
 | Store directory | `client.upload_directory(receipt.id, "/path/to/dir", pattern="*.pdf", recursive=True)` |
 | Confirm hash | `client.confirm_file(receipt.id, "file.txt", confirm_url=urls.confirm_url)` |
+| Batch confirm | `client.confirm_files(receipt.id, ["a.txt", "b.txt"])` — ONE auto-reattest cycle for the whole batch |
 | Get data | `file_urls = client.get_file_urls(receipt.id, "file.txt")` then `client.download_bytes(file_urls.download_url)` |
+| Stream to disk | `client.download_to_file(file_urls.download_url, "/path/to/save.bin")` |
 | List files | `files = client.list_files(receipt.id)` |
 | Delete file | `client.delete_file(receipt.id, "file.txt")` |
 | Receipt hash | `check = client.verify_receipt_hash(receipt.id)` |
-| Verify | `result = client.verify_storage(receipt.id)` |
-| Attest | `att = client.attest(receipt.id)` |
+| Verify (fast structural) | `result = client.verify_storage(receipt.id)` |
+| Recompute verify (byte-level) | `rcv = client.recompute_verify(receipt.id)` — re-downloads every file, scales with locker bytes |
+| Attest (sync) | `att = client.attest(receipt.id)` |
+| Attest (async / batch-friendly) | `att = client.attest_async(receipt.id)` — polls until `merkle_root` settles |
 | Merkle proof | `proof = client.get_merkle_proof(receipt.id, "file.txt")` |
 | Files manifest | `client.get_files_manifest(receipt.id)` |
 | Locker record | `client.get_locker_record(receipt.id)` |
@@ -263,6 +270,7 @@ client = Nukez(keypair_path="~/.config/solana/id.json", network="mainnet-beta")
 | "File not found" | Check `client.list_files(receipt_id)` to see what exists |
 | `ReceiptStateNotBoundError` | Call `client.bind_receipt(receipt)` before the op (cross-session / fresh-client flows) |
 | `AuthenticationError: Envelope sig_alg '...' incompatible with ... network` | Dual-key client picked wrong signer — call `client.bind_receipt(receipt)` first |
+| `NukezError("attest_timeout: ...")` from `attest_async()` | The merkle root didn't settle within `max_wait`. Continue polling `verify_storage()` manually, or retry `attest_async()` to re-enqueue (two attempts inside the 5-sec Cloud Tasks dedup window collapse to one on-chain push) |
 
 ---
 

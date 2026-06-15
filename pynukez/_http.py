@@ -35,7 +35,7 @@ from .types import SplTransfer
 
 # Standard headers shared by sync and async clients
 STANDARD_HEADERS = {
-    "User-Agent": "nukez-sdk/4.0.19",
+    "User-Agent": "nukez-sdk/4.0.20",
     "Accept": "application/json",
     "Content-Type": "application/json",
 }
