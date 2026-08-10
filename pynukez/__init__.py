@@ -119,7 +119,9 @@ from .discovery import (
     get_current_price,
 )
 
-__version__ = "4.0.21"
+# The version string lives in _version.py so the HTTP layer's User-Agent
+# header can derive from the same value without a circular import.
+from ._version import __version__
 
 __all__ = [
     # Main client
@@ -1131,7 +1133,7 @@ def get_tool_definitions() -> list:
             "type": "function",
             "function": {
                 "name": "nukez_verify_storage",
-                "description": "Verify storage integrity and get cryptographic attestation. Returns merkle_root (hash of all files), manifest_signature (gateway's Ed25519 signature), att_code (on-chain attestation badge), file_count, and per-file content hashes. Call after uploading data to confirm integrity.",
+                "description": "Verify storage integrity and get cryptographic attestation. Returns merkle_root (hash of all files), manifest_signature (gateway's Ed25519 signature), att_code (a nine-digit integer derived from result_hash, pushed on-chain), file_count, and per-file content hashes. This structural check trusts the recorded hashes; use recompute_verify for a byte-level re-hash. Call after uploading data to confirm integrity.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1192,7 +1194,7 @@ def get_tool_definitions() -> list:
             "type": "function",
             "function": {
                 "name": "nukez_attest",
-                "description": "Build a Merkle tree from confirmed file hashes and optionally push the root on-chain. This is step 2 of the attestation trust chain. Must call confirm_file for each file first. Returns tx_signature (on-chain attestation tx) and push_ok status.",
+                "description": "Build a Merkle tree from confirmed file hashes and anchor the root on-chain. This is step 2 of the attestation trust chain. Must call confirm_file for each file first. Sync and async requests enqueue the same background job; the gateway's Cloud Tasks worker performs the single on-chain push. Returns tx_signature (on-chain attestation tx) and push_ok status once the job completes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1202,7 +1204,7 @@ def get_tool_definitions() -> list:
                         },
                         "sync": {
                             "type": "boolean",
-                            "description": "If true (default), wait for attestation to complete. If false, return 202 and poll verify_storage for result.",
+                            "description": "If true (default), the gateway polls server-side (90-second default ceiling) and usually returns the completed attestation; if the ceiling expires it returns a 202-style accepted response. If false, return 202 immediately and poll verify_storage for the result.",
                             "default": True
                         }
                     },

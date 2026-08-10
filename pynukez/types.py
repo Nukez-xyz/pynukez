@@ -209,7 +209,10 @@ class FileUrls:
     expires_in_sec: int
     # Absolute confirm URL from the gateway (new in gateway Phase N-4).
     # POST to this after upload to populate content_hash in the manifest.
-    # No signed envelope required — receipt_id in the URL is the bearer auth.
+    # The confirm endpoint requires a payer-signed locker:write envelope
+    # bound to this URL's exact path and query — holding the receipt_id in
+    # the URL is not authorization by itself. confirm_file()/confirm_files()
+    # build and sign that envelope automatically.
     # None when talking to older gateways that don't return this field.
     confirm_url: Optional[str] = None
 
@@ -464,10 +467,20 @@ class ConfirmResult:
 
 @dataclass
 class BatchConfirmResult:
-    """Result of confirming multiple file uploads."""
+    """Result of confirming multiple file uploads.
+
+    Mirrors the gateway's confirm-batch response shape: ``results`` carries
+    the successfully confirmed files only, while failures are reported
+    separately. ``errors`` is the gateway's failure count and
+    ``error_details`` carries the gateway's per-file error records verbatim
+    (``None`` when every file confirmed). ``failed_count`` reports the same
+    failure count as ``errors`` and is retained for backward compatibility.
+    """
     results: List[ConfirmResult]
     confirmed_count: int
     failed_count: int
+    errors: int = 0
+    error_details: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -555,6 +568,11 @@ class RecomputeVerifyResult:
     verify_storage() or attest() instead — those trust the manifest's
     recorded content_hash. recompute_verify is the honest "prove the bytes
     still match" path; its latency scales with total locker bytes.
+
+    The call is authenticated by the payer keypair: the SDK sends a signed
+    envelope with ops=["locker:read"], so the client must be configured with
+    a signing key (or an authorized operator key). The gateway performs the
+    recompute entirely in memory and never modifies the stored attestation.
 
     Attributes:
         receipt_id: Receipt the verification was scoped to.

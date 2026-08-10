@@ -906,3 +906,59 @@ class TestSetOwner:
         state = client._receipt_state["receipt-123"]
         assert state.owner_identity == real_owner
         assert state.sig_alg == "secp256k1"  # inferred from 0x prefix
+
+
+class TestUploadFilesConfirmFailure:
+    """upload_files() must not swallow confirm failures.
+
+    Routine attestation trusts the manifest's recorded content_hash and does
+    not recompute hashes, so a file whose confirm silently failed would stay
+    unverified forever while being reported as an upload success. A confirm
+    failure must count the file as failed and record the error, the same way
+    bulk_upload_paths propagates confirm failures.
+    """
+
+    @patch("pynukez.client.Keypair")
+    def test_confirm_failure_counts_file_as_failed(self, mock_kp):
+        client = Nukez(keypair_path="~/.config/solana/id.json")
+        client.create_file = MagicMock(return_value=MagicMock(
+            upload_url="https://storage.example/upload",
+        ))
+        client.upload_bytes = MagicMock(return_value=MagicMock())
+
+        def _confirm(receipt_id, fname):
+            if fname == "b.txt":
+                raise NukezError("confirm exploded")
+            return MagicMock()
+
+        client.confirm_file = MagicMock(side_effect=_confirm)
+
+        files = [
+            {"filename": "a.txt", "content": b"aa"},
+            {"filename": "b.txt", "content": b"bb"},
+        ]
+        result = client.upload_files("r1", files, workers=1)
+
+        assert result.total == 2
+        assert result.uploaded == 1
+        assert result.failed == 1
+        errors = dict(result.errors)
+        assert "b.txt" in errors
+        assert "confirm exploded" in errors["b.txt"]
+
+    @patch("pynukez.client.Keypair")
+    def test_confirm_success_still_counts_as_uploaded(self, mock_kp):
+        client = Nukez(keypair_path="~/.config/solana/id.json")
+        client.create_file = MagicMock(return_value=MagicMock(
+            upload_url="https://storage.example/upload",
+        ))
+        client.upload_bytes = MagicMock(return_value=MagicMock())
+        client.confirm_file = MagicMock(return_value=MagicMock())
+
+        result = client.upload_files(
+            "r1", [{"filename": "a.txt", "content": b"aa"}], workers=1,
+        )
+
+        assert result.uploaded == 1
+        assert result.failed == 0
+        client.confirm_file.assert_called_once_with("r1", "a.txt")

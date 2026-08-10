@@ -25,7 +25,7 @@ import httpx as _httpx
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Callable
 from dataclasses import dataclass
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from .types import (
     StorageRequest,
     SplTransfer,
@@ -76,6 +76,7 @@ from ._helpers import (
     _normalize_expected_sha256,
     _is_sandbox_path_unavailable_error,
     _is_gateway_short_url,
+    _validated_confirm_url,
     _normalize_viewer_base_url,
     _viewer_button_ui,
     _viewer_renderer_contract,
@@ -1349,6 +1350,15 @@ class Nukez:
 
         This is context-safe for MCP/LLM flows because only file paths are passed
         through tool calls; file bytes are read directly from disk in the SDK.
+
+        The flow is create_files_batch, then parallel uploads, then one
+        batch confirm (when ``confirm=True``), then an optional attest.
+        The confirm step signs a payer ``locker:write`` envelope through
+        ``confirm_files()``, so the client must be configured with a
+        signing key; without one the confirm raises instead of silently
+        skipping. Confirm failures surface to the caller: a raised batch
+        confirm propagates, and any file the gateway could not confirm
+        comes back with ``confirmed: False`` in the per-file results.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2027,6 +2037,21 @@ class Nukez:
             URLs that do not look like gateway short URLs fall straight
             through to a one-shot PUT — the escape hatch for callers who
             already have a resolved storage URL.
+
+        Short-URL contract details:
+            Short-URL tokens are method-bound: the Ed25519-signed token
+            commits to one HTTP method, and the gateway rejects any other
+            method with 403. When the gateway itself proxies a PUT
+            (``?proxy=1``), it hashes the bytes it observes and records
+            that hash into the manifest the same way confirm does; the
+            ``X-Nukez-Content-Hash-Recorded`` response header reports
+            whether that write-back landed. When the
+            gateway instead answers with the 307 redirect (this method's
+            normal path), the bytes go straight to storage without passing
+            through the gateway, so the redirect carries
+            ``X-Nukez-Confirm-Required: true`` — you must still call
+            ``confirm_file()`` afterward so the manifest records the
+            server-computed hash.
         """
         headers = {"Content-Type": content_type or "application/octet-stream"}
 
@@ -3214,6 +3239,18 @@ class Nukez:
         This is the stored receipt object returned by the gateway after payment
         confirmation. Use verify_receipt_hash() when you want the gateway to
         recompute and compare the receipt's canonical hash.
+
+        The document carries the material for offline verification:
+        ``receipt_signer_pubkey`` is a 64-hex-character Ed25519 public
+        key, and ``receipt_sig`` is a 128-hex-character signature over the
+        canonical receipt-plus-manifest payload. The same key also
+        verifies the attestation's ``manifest_signature`` (returned by
+        ``verify_storage()``), which is a 128-hex-character signature over
+        the bare merkle root. A verifier that wants to be fully trust-free
+        should pin ``receipt_signer_pubkey`` out of band rather than
+        fetching it from the same gateway it is auditing. Note that the
+        ``/v1/short-url/verify-key`` endpoint serves a different key (the
+        short-URL token signer), not the receipt signer.
         """
         return self.http.get(f"/v1/receipts/{receipt_id}")
 
@@ -3254,21 +3291,34 @@ class Nukez:
     def verify_storage(self, receipt_id: str) -> VerificationResult:
         """
         Verify storage integrity and get cryptographic attestation.
-        
+
+        This is the fast structural check: it reads the persisted
+        attestation and proves presence and consistency — the manifest
+        entries exist and their recorded hashes form the Ed25519-signed
+        merkle root. It does not re-hash stored bytes; for that byte-level
+        check, call ``recompute_verify()``.
+
         Returns the unified verification response including:
         - Receipt verification (payment confirmed on-chain)
         - Attestation data (merkle root, file hashes, gateway signature)
         - On-chain attestation code (if Switchboard push has occurred)
-        
+
         Args:
             receipt_id: Receipt ID from confirm_storage()
-            
+
         Returns:
             VerificationResult with:
             - verified: True if receipt + attestation are valid
-            - merkle_root: SHA256 merkle root of all files in locker
-            - manifest_signature: Gateway's Ed25519 signature over the merkle root
-            - att_code: Numeric attestation code (from Switchboard on-chain push)
+            - merkle_root: SHA256 merkle root of all files in locker; the
+              gateway signs this value and it rides in the SPL memo
+            - manifest_signature: Gateway's Ed25519 signature over the bare
+              merkle root (128 hex characters; verify it against the
+              64-hex receipt_signer_pubkey served by get_receipt())
+            - result_hash: Canonical attestation hash; distinct from
+              merkle_root, and the source of att_code
+            - att_code: Nine-digit integer derived from result_hash (strip
+              "sha256:", first 12 hex characters as an integer, modulo
+              1,000,000,000) — never hex, never derived from merkle_root
             - file_count: Number of files covered by attestation
             - files: List of {filename, content_hash, size_bytes} for each file
             - verify_url: Public verification page URL
@@ -3310,7 +3360,12 @@ class Nukez:
         in seconds independent of locker size.
 
         Gateway endpoint: ``GET /v1/storage/recompute-verify?receipt_id=...``.
-        Public-by-receipt_id — no signed envelope required.
+        Auth: signed envelope, ``ops=["locker:read"]``, signed by the payer
+        keypair (or an authorized operator key). The endpoint makes the
+        gateway re-download file bytes from storage, so it carries the same
+        authentication as the locker read endpoints. The SDK builds the
+        envelope (with the receipt_id query string bound) and adds the
+        headers; the client must be configured with a signing key.
 
         Args:
             receipt_id: Receipt ID from confirm_storage().
@@ -3324,7 +3379,27 @@ class Nukez:
             ``file_count``, ``recompute_ms``, and the full response under
             ``details``.
         """
-        kwargs: Dict[str, Any] = {"params": {"receipt_id": receipt_id}}
+        params = {"receipt_id": receipt_id}
+
+        # /v1/storage/recompute-verify is a signed endpoint
+        # (ops=["locker:read"]). Its argument travels in the query string,
+        # so the envelope must bind that query string — see
+        # build_signed_envelope's `query` parameter.
+        signer = self._require_signer("recompute_verify", receipt_id)
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="GET",
+            path="/v1/storage/recompute-verify",
+            query=urlencode(params),
+            ops=["locker:read"],
+            delegating=self._is_delegating(receipt_id),
+        )
+
+        kwargs: Dict[str, Any] = {
+            "params": params,
+            "headers": envelope.headers,
+        }
         if timeout is not None:
             kwargs["timeout"] = timeout
         response = self.http.get("/v1/storage/recompute-verify", **kwargs)
@@ -3393,27 +3468,63 @@ class Nukez:
     # CONFIRMATION & ATTESTATION (Trust boundary closure)
     # =========================================================================
 
-    def _post_confirm(self, confirm_url: Optional[str], fallback_path: str,
-                      fallback_params: Dict[str, Any],
+    def _post_confirm(self, receipt_id: str, confirm_url: Optional[str],
+                      fallback_path: str, fallback_params: Dict[str, Any],
                       timeout: Optional[int] = None) -> Dict[str, Any]:
         """
-        POST to a confirm endpoint. Prefers the absolute confirm_url returned
-        by create_file/create_files_batch; falls back to the hardcoded path
-        for backward compatibility with older gateways.
+        POST to a confirm endpoint with a payer-signed envelope. Prefers the
+        absolute confirm_url returned by create_file/create_files_batch; falls
+        back to the hardcoded path for backward compatibility with older
+        gateways.
 
-        Gateway confirm routes are public-by-receipt_id — no signed envelope
-        required. receipt_id in the URL is the bearer credential.
+        The gateway confirm routes require a signed envelope with the
+        ``locker:write`` operation, the same authority as the create_file step
+        that precedes them. Because the confirm arguments travel in the query
+        string, the envelope binds the exact query of whichever URL is
+        actually sent — the confirm_url's own query, or the urlencoded
+        fallback params. The gateway also cross-checks that the envelope's
+        receipt_id matches the query receipt_id.
 
         Args:
+            receipt_id: Receipt ID the envelope is signed for.
             confirm_url: Absolute confirm URL from create_file()/create_files_batch().
             fallback_path: Hardcoded path used when confirm_url is unset.
             fallback_params: Query params for the fallback path.
             timeout: Per-call timeout (seconds). Defaults to self.timeout.
         """
         eff_timeout = timeout if timeout is not None else self.timeout
+        signer = self._require_signer("confirm", receipt_id)
+        # The confirm URL comes from a server response, and the envelope
+        # below binds whatever path and query it carries. To keep a poisoned
+        # create response from obtaining a payer-signed locker:write envelope
+        # for an arbitrary path, only use the URL when it targets this
+        # client's own gateway at the expected confirm path; otherwise fall
+        # back to the client-constructed request.
         if confirm_url:
+            confirm_url = _validated_confirm_url(
+                confirm_url, fallback_path, self.base_url,
+            )
+        if confirm_url:
+            # Bind the envelope to the exact path and query embedded in the
+            # server-issued confirm URL; the request replays that URL as-is.
+            parts = urlsplit(confirm_url)
+            envelope = build_signed_envelope(
+                signer=signer,
+                receipt_id=receipt_id,
+                method="POST",
+                path=parts.path,
+                query=parts.query,
+                ops=["locker:write"],
+                body={},
+                delegating=self._is_delegating(receipt_id),
+            )
             try:
-                resp = self._raw_client.post(confirm_url, timeout=eff_timeout)
+                resp = self._raw_client.post(
+                    confirm_url,
+                    headers=envelope.headers,
+                    content=envelope.canonical_body.encode("utf-8"),
+                    timeout=eff_timeout,
+                )
                 if resp.status_code >= 400:
                     # Route through normal error handling
                     from ._http import handle_error_response
@@ -3423,7 +3534,21 @@ class Nukez:
                 raise NukezError(f"Request timed out after {eff_timeout}s: POST confirm")
             except _httpx.HTTPError as e:
                 raise NukezError(f"Request failed: POST confirm: {e}")
-        post_kwargs: Dict[str, Any] = {"params": fallback_params}
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="POST",
+            path=fallback_path,
+            query=urlencode(fallback_params, doseq=True),
+            ops=["locker:write"],
+            body={},
+            delegating=self._is_delegating(receipt_id),
+        )
+        post_kwargs: Dict[str, Any] = {
+            "headers": envelope.headers,
+            "params": fallback_params,
+            "content": envelope.canonical_body.encode("utf-8"),
+        }
         if timeout is not None:
             post_kwargs["timeout"] = timeout
         return self.http.post(fallback_path, **post_kwargs)
@@ -3464,11 +3589,14 @@ class Nukez:
             If AUTO_REATTEST is enabled server-side, this also triggers
             re-attestation so the merkle root stays current.
 
-            receipt_id is a bearer credential — anyone holding it can
-            confirm files on this locker. Don't log or share confirm_url
-            in error messages or third-party sinks.
+            Auth: signed envelope, ``ops=["locker:write"]`` — the same
+            authority as create_file(). The SDK builds the envelope (with
+            the query string bound) and adds the headers, so a signing key
+            is required. Holding a receipt_id alone is no longer enough to
+            confirm files on a locker.
         """
         response = self._post_confirm(
+            receipt_id,
             confirm_url,
             "/v1/files/confirm",
             {"receipt_id": receipt_id, "filename": filename},
@@ -3505,8 +3633,34 @@ class Nukez:
             timeout: Optional per-call timeout (seconds). Defaults to the
                 client's effective timeout (120s). Raise for very large
                 batches where the gateway needs more time to compute hashes.
+
+        Auth: signed envelope, ``ops=["locker:write"]`` — the same authority
+        as create_files_batch(). The SDK builds the envelope (with the query
+        string bound) and adds the headers, so a signing key is required.
         """
+        # confirm_batch_url pre-encodes the filenames of the ENTIRE batch
+        # created by create_files_batch. When the caller asks to confirm a
+        # different set (e.g. bulk_upload_paths confirming only the files
+        # that actually uploaded), posting that URL would confirm files the
+        # caller never asked for — including re-recording stale bytes for a
+        # file whose fresh upload failed. The URL must also carry exactly the
+        # caller's receipt_id: signing a URL that names a different receipt
+        # would bind the payer's envelope to a locker the caller never chose.
+        # Use the URL only when both the filename set and the receipt_id
+        # match the request; otherwise fall back to the hardcoded path, which
+        # sends exactly the requested filenames and receipt.
+        if confirm_batch_url:
+            from urllib.parse import parse_qsl
+            url_pairs = parse_qsl(
+                urlsplit(confirm_batch_url).query, keep_blank_values=True,
+            )
+            url_filenames = sorted(v for k, v in url_pairs if k == "filenames")
+            url_receipt_ids = [v for k, v in url_pairs if k == "receipt_id"]
+            if url_filenames != sorted(filenames) or url_receipt_ids != [receipt_id]:
+                confirm_batch_url = None
+
         response = self._post_confirm(
+            receipt_id,
             confirm_batch_url,
             "/v1/files/confirm-batch",
             {"receipt_id": receipt_id, "filenames": filenames},
@@ -3522,10 +3676,20 @@ class Nukez:
                 confirmed=r.get("status") != "error",
             ))
 
+        # The gateway reports successes in "results" and failures separately:
+        # "errors" is the failure count and "error_details" carries the
+        # per-file error records (or null when every file confirmed). The
+        # response has no "failed" key, so the failure count must come from
+        # "errors" — reading the nonexistent key here used to report partial
+        # failures as full success.
+        errors_count = int(response.get("errors") or 0)
+
         return BatchConfirmResult(
             results=results,
             confirmed_count=response.get("confirmed", len([r for r in results if r.confirmed])),
-            failed_count=response.get("failed", len([r for r in results if not r.confirmed])),
+            failed_count=errors_count,
+            errors=errors_count,
+            error_details=response.get("error_details"),
         )
 
     def attest(
@@ -3535,33 +3699,49 @@ class Nukez:
         timeout: Optional[int] = None,
     ) -> AttestResult:
         """
-        Trigger attestation — compute merkle root and optionally push on-chain.
+        Trigger attestation — compute the merkle root and anchor it on-chain.
 
-        The gateway no longer re-downloads file bytes on every attestation;
-        it trusts the manifest's recorded content_hash. Latency is bounded by
-        the on-chain Switchboard confirmation (~5-10s typical), not by locker
-        size. For byte-level proof that the persisted hashes still match
+        The gateway does not re-download file bytes during attestation; it
+        trusts the manifest's recorded content_hash values, so a green
+        attestation proves presence and consistency (every manifest entry
+        exists in storage and the recorded hashes form the signed merkle
+        root). For byte-level proof that the persisted hashes still match
         storage contents, call ``recompute_verify()`` instead — that path
         re-downloads everything and latency scales with locker bytes.
+
+        Both sync and async requests enqueue the same background job; the
+        gateway's Cloud Tasks worker is the single code path that computes
+        the attestation and pushes it on-chain. With ``sync=True`` the
+        gateway holds the request open and polls the persisted attestation
+        server-side until it reaches a terminal state, then returns it. If
+        the server-side poll ceiling (90 seconds by default) expires while
+        the job is still in flight, the gateway returns a 202-style
+        response with status "accepted" instead of the finished result; in
+        that case, poll ``verify_storage()`` until ``merkle_root`` is
+        truthy. The request never blocks on an in-request on-chain push.
 
         Auth: signed envelope, ``ops=["locker:attest"]``. The SDK builds the
         envelope (with the query string bound) and adds the headers.
 
         Args:
             receipt_id: Receipt ID from confirm_storage().
-            sync: If True (default), wait for attestation to complete and
-                return the full result. If False, return immediately with
-                status="accepted" — poll ``verify_storage()`` for a truthy
-                ``merkle_root`` (or call ``attest_async()`` to do the polling
-                for you).
+            sync: If True (default), the gateway polls server-side and
+                usually returns the completed attestation in one call (or a
+                202-style "accepted" response if its poll ceiling expires
+                first). If False, return immediately with status="accepted"
+                — poll ``verify_storage()`` for a truthy ``merkle_root``
+                (or call ``attest_async()`` to do the polling for you).
             timeout: Optional per-call timeout (seconds). Defaults to the
-                client's effective timeout (120s). Sync attest should
-                complete well within that even on large lockers given the
-                Patch-1 fast path.
+                client's effective timeout (120s), which comfortably covers
+                the gateway's default 90-second server-side poll ceiling.
 
         Returns:
             AttestResult with merkle_root, file_count, att_code, status,
-            push_ok, tx_signature, switchboard_slot.
+            push_ok, tx_signature, switchboard_slot. The att_code is a
+            nine-digit integer that the gateway derives from result_hash
+            (not from merkle_root): it strips the "sha256:" prefix, reads
+            the first 12 hex characters as an integer, and reduces it
+            modulo 1,000,000,000.
 
         Example:
             client.upload_bytes(urls.upload_url, data)
@@ -3696,8 +3876,11 @@ class Nukez:
                 - content_type (str, optional): MIME type (default: application/octet-stream)
             workers: Number of concurrent upload threads (default: 10)
             confirm: If True (default), call confirm_file() after each upload
-                     to close the trust boundary. If False, skip confirmation
-                     (caller is responsible for confirming later).
+                     to close the trust boundary. A confirm failure counts
+                     the file as failed and records the error, because an
+                     unconfirmed upload has no verified content_hash in the
+                     manifest. If False, skip confirmation (caller is
+                     responsible for confirming later).
             on_progress: Optional callback(filename, success, index, total)
                          called after each file completes.
 
@@ -3738,10 +3921,16 @@ class Nukez:
                 result = self.upload_bytes(urls.upload_url, content, content_type=ctype)
 
                 if confirm:
-                    try:
-                        self.confirm_file(receipt_id, fname)
-                    except Exception:
-                        pass  # Non-fatal — attestation will still compute hashes
+                    # A confirm failure must surface, not be swallowed:
+                    # routine attestation trusts the manifest's recorded
+                    # content_hash and does not recompute hashes, so a file
+                    # whose confirm silently failed would stay unverified
+                    # forever while being reported as a success. Letting the
+                    # exception reach the outer handler records the file in
+                    # the errors list and the failed count, consistent with
+                    # bulk_upload_paths, which also propagates confirm
+                    # failures to the caller.
+                    self.confirm_file(receipt_id, fname)
 
                 return (fname, True, None, result)
             except Exception as e:

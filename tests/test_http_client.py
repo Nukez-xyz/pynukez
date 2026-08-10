@@ -38,6 +38,35 @@ class MockResponse:
             raise Exception(f"HTTP {self.status_code}")
 
 
+class TestStandardHeaders:
+    """The shared header block must always advertise the real SDK version."""
+
+    def test_user_agent_derives_from_package_version(self):
+        """The User-Agent string is built from pynukez.__version__, so the
+        two can never drift apart the way the hardcoded 4.0.21 literal did
+        while the package was already versioned 4.0.22."""
+        import pynukez
+        from pynukez._http import STANDARD_HEADERS
+
+        assert STANDARD_HEADERS["User-Agent"] == f"nukez-sdk/{pynukez.__version__}"
+
+    def test_package_version_matches_pyproject(self):
+        """pyproject.toml and pynukez.__version__ must agree, since the
+        User-Agent (and any other derived string) follows the package
+        version."""
+        import re
+        from pathlib import Path
+
+        import pynukez
+
+        pyproject = Path(__file__).parent.parent / "pyproject.toml"
+        match = re.search(
+            r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.MULTILINE,
+        )
+        assert match is not None, "pyproject.toml is missing a version field"
+        assert match.group(1) == pynukez.__version__
+
+
 class TestNukezHTTPInit:
     """HTTP client initialization tests."""
 

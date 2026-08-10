@@ -33,7 +33,7 @@ logger = logging.getLogger("pynukez.async_client")
 import httpx as _httpx
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Callable
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from .types import (
     StorageRequest,
@@ -77,7 +77,7 @@ from .errors import (
 )
 from .hardening import sanitize_upload_data, validate_signed_url
 from ._async_http import AsyncHTTPClient
-from ._helpers import _is_gateway_short_url
+from ._helpers import _is_gateway_short_url, _validated_confirm_url
 from ._http import caip2_to_friendly
 
 VIEWER_RENDERER_CONTRACT_NAME = "nukez.mcp.viewer_link"
@@ -1070,7 +1070,17 @@ class AsyncNukez:
         attest_sync: bool = False,
         on_progress: Optional[Callable[[str, bool, int, int], None]] = None,
     ) -> Dict[str, Any]:
-        """Upload multiple local files by path with optional confirm + attestation."""
+        """Upload multiple local files by path with optional confirm + attestation.
+
+        The flow is create_files_batch, then parallel uploads, then one
+        batch confirm (when ``confirm=True``), then an optional attest.
+        The confirm step signs a payer ``locker:write`` envelope through
+        ``confirm_files()``, so the client must be configured with a
+        signing key; without one the confirm raises instead of silently
+        skipping. Confirm failures surface to the caller: a raised batch
+        confirm propagates, and any file the gateway could not confirm
+        comes back with ``confirmed: False`` in the per-file results.
+        """
         normalized = self._normalize_path_sources(sources)
         t0 = time.time()
 
@@ -2175,7 +2185,17 @@ class AsyncNukez:
         return (await self.verify_receipt_hash(receipt_id)).matches
 
     async def verify_storage(self, receipt_id: str) -> VerificationResult:
-        """Verify storage integrity and get cryptographic attestation."""
+        """Verify storage integrity and get cryptographic attestation.
+
+        This is the fast structural check: it reads the persisted
+        attestation and proves presence and consistency — the manifest
+        entries exist and their recorded hashes form the Ed25519-signed
+        merkle root. It does not re-hash stored bytes; for that byte-level
+        check, call ``recompute_verify()``. The returned att_code is a
+        nine-digit integer derived from result_hash (strip "sha256:",
+        first 12 hex characters as an integer, modulo 1,000,000,000); it
+        is never hex and never derived from merkle_root.
+        """
         response = await self.http.get(
             "/v1/storage/verify",
             params={"receipt_id": receipt_id},
@@ -2218,7 +2238,12 @@ class AsyncNukez:
         in seconds independent of locker size.
 
         Gateway endpoint: ``GET /v1/storage/recompute-verify?receipt_id=...``.
-        Public-by-receipt_id — no signed envelope required.
+        Auth: signed envelope, ``ops=["locker:read"]``, signed by the payer
+        keypair (or an authorized operator key). The endpoint makes the
+        gateway re-download file bytes from storage, so it carries the same
+        authentication as the locker read endpoints. The SDK builds the
+        envelope (with the receipt_id query string bound) and adds the
+        headers; the client must be configured with a signing key.
 
         Args:
             receipt_id: Receipt ID from confirm_storage().
@@ -2231,7 +2256,27 @@ class AsyncNukez:
             ``file_count``, ``recompute_ms``, and the full response under
             ``details``.
         """
-        kwargs: Dict[str, Any] = {"params": {"receipt_id": receipt_id}}
+        params = {"receipt_id": receipt_id}
+
+        # /v1/storage/recompute-verify is a signed endpoint
+        # (ops=["locker:read"]). Its argument travels in the query string,
+        # so the envelope must bind that query string — see
+        # build_signed_envelope's `query` parameter.
+        signer = self._require_signer("recompute_verify", receipt_id)
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="GET",
+            path="/v1/storage/recompute-verify",
+            query=urlencode(params),
+            ops=["locker:read"],
+            delegating=self._is_delegating(receipt_id),
+        )
+
+        kwargs: Dict[str, Any] = {
+            "params": params,
+            "headers": envelope.headers,
+        }
         if timeout is not None:
             kwargs["timeout"] = timeout
         response = await self.http.get("/v1/storage/recompute-verify", **kwargs)
@@ -2247,27 +2292,65 @@ class AsyncNukez:
 
     async def _post_confirm(
         self,
+        receipt_id: str,
         confirm_url: Optional[str],
         fallback_path: str,
         fallback_params: Dict[str, Any],
         timeout: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        POST to a confirm endpoint. Prefers the absolute confirm_url returned
-        by create_file/create_files_batch; falls back to the hardcoded path.
+        POST to a confirm endpoint with a payer-signed envelope. Prefers the
+        absolute confirm_url returned by create_file/create_files_batch;
+        falls back to the hardcoded path.
 
-        Gateway confirm routes are public-by-receipt_id — no envelope required.
+        The gateway confirm routes require a signed envelope with the
+        ``locker:write`` operation, the same authority as the create_file
+        step that precedes them. Because the confirm arguments travel in
+        the query string, the envelope binds the exact query of whichever
+        URL is actually sent — the confirm_url's own query, or the
+        urlencoded fallback params. The gateway also cross-checks that the
+        envelope's receipt_id matches the query receipt_id.
 
         Args:
+            receipt_id: Receipt ID the envelope is signed for.
             confirm_url: Absolute confirm URL from create_file()/create_files_batch().
             fallback_path: Hardcoded path used when confirm_url is unset.
             fallback_params: Query params for the fallback path.
             timeout: Per-call timeout (seconds). Defaults to self.timeout.
         """
         eff_timeout = timeout if timeout is not None else self.timeout
+        signer = self._require_signer("confirm", receipt_id)
+        # The confirm URL comes from a server response, and the envelope
+        # below binds whatever path and query it carries. To keep a poisoned
+        # create response from obtaining a payer-signed locker:write envelope
+        # for an arbitrary path, only use the URL when it targets this
+        # client's own gateway at the expected confirm path; otherwise fall
+        # back to the client-constructed request.
         if confirm_url:
+            confirm_url = _validated_confirm_url(
+                confirm_url, fallback_path, self.base_url,
+            )
+        if confirm_url:
+            # Bind the envelope to the exact path and query embedded in the
+            # server-issued confirm URL; the request replays that URL as-is.
+            parts = urlsplit(confirm_url)
+            envelope = build_signed_envelope(
+                signer=signer,
+                receipt_id=receipt_id,
+                method="POST",
+                path=parts.path,
+                query=parts.query,
+                ops=["locker:write"],
+                body={},
+                delegating=self._is_delegating(receipt_id),
+            )
             try:
-                resp = await self._raw_client.post(confirm_url, timeout=eff_timeout)
+                resp = await self._raw_client.post(
+                    confirm_url,
+                    headers=envelope.headers,
+                    content=envelope.canonical_body.encode("utf-8"),
+                    timeout=eff_timeout,
+                )
                 if resp.status_code >= 400:
                     from ._http import handle_error_response
                     handle_error_response(resp)
@@ -2276,7 +2359,21 @@ class AsyncNukez:
                 raise NukezError(f"Request timed out after {eff_timeout}s: POST confirm")
             except _httpx.HTTPError as e:
                 raise NukezError(f"Request failed: POST confirm: {e}")
-        post_kwargs: Dict[str, Any] = {"params": fallback_params}
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="POST",
+            path=fallback_path,
+            query=urlencode(fallback_params, doseq=True),
+            ops=["locker:write"],
+            body={},
+            delegating=self._is_delegating(receipt_id),
+        )
+        post_kwargs: Dict[str, Any] = {
+            "headers": envelope.headers,
+            "params": fallback_params,
+            "content": envelope.canonical_body.encode("utf-8"),
+        }
         if timeout is not None:
             post_kwargs["timeout"] = timeout
         return await self.http.post(fallback_path, **post_kwargs)
@@ -2294,8 +2391,13 @@ class AsyncNukez:
             filename: Name of the file to confirm
             confirm_url: Optional absolute confirm URL from create_file() response.
                 Prefers this when provided; falls back to hardcoded path otherwise.
+
+        Auth: signed envelope, ``ops=["locker:write"]`` — the same authority
+        as create_file(). The SDK builds the envelope (with the query string
+        bound) and adds the headers, so a signing key is required.
         """
         response = await self._post_confirm(
+            receipt_id,
             confirm_url,
             "/v1/files/confirm",
             {"receipt_id": receipt_id, "filename": filename},
@@ -2328,8 +2430,34 @@ class AsyncNukez:
                 create_files_batch() response.
             timeout: Optional per-call timeout (seconds). Defaults to the
                 client's effective timeout (120s).
+
+        Auth: signed envelope, ``ops=["locker:write"]`` — the same authority
+        as create_files_batch(). The SDK builds the envelope (with the query
+        string bound) and adds the headers, so a signing key is required.
         """
+        # confirm_batch_url pre-encodes the filenames of the ENTIRE batch
+        # created by create_files_batch. When the caller asks to confirm a
+        # different set (e.g. bulk_upload_paths confirming only the files
+        # that actually uploaded), posting that URL would confirm files the
+        # caller never asked for — including re-recording stale bytes for a
+        # file whose fresh upload failed. The URL must also carry exactly the
+        # caller's receipt_id: signing a URL that names a different receipt
+        # would bind the payer's envelope to a locker the caller never chose.
+        # Use the URL only when both the filename set and the receipt_id
+        # match the request; otherwise fall back to the hardcoded path, which
+        # sends exactly the requested filenames and receipt.
+        if confirm_batch_url:
+            from urllib.parse import parse_qsl
+            url_pairs = parse_qsl(
+                urlsplit(confirm_batch_url).query, keep_blank_values=True,
+            )
+            url_filenames = sorted(v for k, v in url_pairs if k == "filenames")
+            url_receipt_ids = [v for k, v in url_pairs if k == "receipt_id"]
+            if url_filenames != sorted(filenames) or url_receipt_ids != [receipt_id]:
+                confirm_batch_url = None
+
         response = await self._post_confirm(
+            receipt_id,
             confirm_batch_url,
             "/v1/files/confirm-batch",
             {"receipt_id": receipt_id, "filenames": filenames},
@@ -2345,10 +2473,20 @@ class AsyncNukez:
                 confirmed=r.get("status") != "error",
             ))
 
+        # The gateway reports successes in "results" and failures separately:
+        # "errors" is the failure count and "error_details" carries the
+        # per-file error records (or null when every file confirmed). The
+        # response has no "failed" key, so the failure count must come from
+        # "errors" — reading the nonexistent key here used to report partial
+        # failures as full success.
+        errors_count = int(response.get("errors") or 0)
+
         return BatchConfirmResult(
             results=results,
             confirmed_count=response.get("confirmed", len([r for r in results if r.confirmed])),
-            failed_count=response.get("failed", len([r for r in results if not r.confirmed])),
+            failed_count=errors_count,
+            errors=errors_count,
+            error_details=response.get("error_details"),
         )
 
     async def attest(
@@ -2357,26 +2495,42 @@ class AsyncNukez:
         sync: bool = True,
         timeout: Optional[int] = None,
     ) -> AttestResult:
-        """Trigger attestation — compute merkle root and optionally push on-chain.
+        """Trigger attestation — compute the merkle root and anchor it on-chain.
 
-        The gateway no longer re-downloads file bytes on every attestation;
-        it trusts the manifest's recorded content_hash. Latency is bounded by
-        the on-chain Switchboard confirmation (~5-10s typical), not by locker
-        size. For byte-level proof that the persisted hashes still match
+        The gateway does not re-download file bytes during attestation; it
+        trusts the manifest's recorded content_hash values, so a green
+        attestation proves presence and consistency (every manifest entry
+        exists in storage and the recorded hashes form the signed merkle
+        root). For byte-level proof that the persisted hashes still match
         storage contents, call ``recompute_verify()`` instead — that path
         re-downloads everything and latency scales with locker bytes.
+
+        Both sync and async requests enqueue the same background job; the
+        gateway's Cloud Tasks worker is the single code path that computes
+        the attestation and pushes it on-chain. With ``sync=True`` the
+        gateway holds the request open and polls the persisted attestation
+        server-side until it reaches a terminal state, then returns it. If
+        the server-side poll ceiling (90 seconds by default) expires while
+        the job is still in flight, the gateway returns a 202-style
+        response with status "accepted" instead of the finished result; in
+        that case, poll ``verify_storage()`` until ``merkle_root`` is
+        truthy. The request never blocks on an in-request on-chain push.
 
         Auth: signed envelope, ``ops=["locker:attest"]``. The SDK builds the
         envelope (with the query string bound) and adds the headers.
 
         Args:
             receipt_id: Receipt ID from confirm_storage().
-            sync: If True (default), wait for attestation to complete. If
-                False, returns immediately with status="accepted" — poll
-                ``verify_storage()`` for a truthy ``merkle_root`` (or use
-                ``attest_async()`` to do the polling for you).
+            sync: If True (default), the gateway polls server-side and
+                usually returns the completed attestation in one call (or a
+                202-style "accepted" response if its poll ceiling expires
+                first). If False, returns immediately with
+                status="accepted" — poll ``verify_storage()`` for a truthy
+                ``merkle_root`` (or use ``attest_async()`` to do the
+                polling for you).
             timeout: Optional per-call timeout (seconds). Defaults to the
-                client's effective timeout (120s).
+                client's effective timeout (120s), which comfortably covers
+                the gateway's default 90-second server-side poll ceiling.
         """
         params = {"receipt_id": receipt_id}
         if sync:
@@ -2494,7 +2648,12 @@ class AsyncNukez:
         confirm: bool = True,
         on_progress: Optional[Any] = None,
     ) -> BatchUploadResult:
-        """Upload multiple files concurrently with optional confirmation."""
+        """Upload multiple files concurrently with optional confirmation.
+
+        A confirm failure counts the file as failed and records the error,
+        because an unconfirmed upload has no verified content_hash in the
+        manifest.
+        """
         t0 = time.time()
         uploaded_count = 0
         errors = []
@@ -2509,10 +2668,17 @@ class AsyncNukez:
                 result = await self.upload_bytes(urls.upload_url, content, content_type=ctype)
 
                 if confirm:
-                    try:
-                        await self.confirm_file(receipt_id, fname)
-                    except Exception:
-                        pass
+                    # A confirm failure must surface, not be swallowed:
+                    # routine attestation trusts the manifest's recorded
+                    # content_hash and does not recompute hashes, so a file
+                    # whose confirm silently failed would stay unverified
+                    # forever while being reported as a success. Letting the
+                    # exception reach the outer handler records the file in
+                    # the errors list and the failed count, consistent with
+                    # bulk_upload_paths, which also propagates confirm
+                    # failures to the caller.
+                    await self.confirm_file(receipt_id, fname)
+
                 return (fname, True, None, result)
             except Exception as e:
                 return (fname, False, str(e), None)

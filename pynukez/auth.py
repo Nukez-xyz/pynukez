@@ -253,7 +253,10 @@ def build_signed_envelope(
             to it. Omit (default "") for body-only endpoints.
         ops: Required operations (e.g., ["locker:write"])
         body: Request body dict for POST/PUT (will be canonicalized)
-        ttl_seconds: Envelope validity duration (default 5 minutes)
+        ttl_seconds: Envelope validity duration (default 5 minutes). The
+            gateway caps envelope TTL at 300 seconds and rejects longer
+            windows with ENVELOPE_TTL_TOO_LONG, so do not raise this above
+            the default.
         delegating: If True, include signer identity in the envelope
             (operator acting on behalf of owner). If False (default),
             omit signer field (owner-direct operation).
@@ -270,7 +273,9 @@ def build_signed_envelope(
         2. Field name is "receipt_id" not "sub"
         3. Field name is "body_sha256" not "body_hash"
         4. Nonce uses os.urandom(16).hex() for cryptographic randomness
-        5. JSON canonicalization: separators=(',', ':'), sort_keys=True
+        5. JSON canonicalization: separators=(',', ':'), sort_keys=True,
+           ensure_ascii=False, encoded as UTF-8 — the exact formula the
+           gateway's canonical_json_bytes() re-applies before verifying
         6. Envelope is Base64URL-encoded with padding stripped
     """
     # Backward compat: accept keypair as positional or keyword
@@ -300,9 +305,15 @@ def build_signed_envelope(
                     f"Received: {body[:100]}..."
                 )
 
-        # Canonical JSON - EXACT pattern from proven nukez implementation
-        # This MUST match: json.dumps(body, separators=(',', ':'), sort_keys=True)
-        canonical_body = json.dumps(body, separators=(',', ':'), sort_keys=True)
+        # Canonical JSON - EXACT pattern the gateway re-applies server-side.
+        # The gateway's canonical_json_bytes() uses ensure_ascii=False and
+        # encodes the result as UTF-8, so the client must serialize the same
+        # way: for pure-ASCII bodies the bytes are identical to the old
+        # ensure_ascii=True form, and for non-ASCII bodies only this form
+        # hashes to the value the gateway computes.
+        canonical_body = json.dumps(
+            body, separators=(',', ':'), sort_keys=True, ensure_ascii=False,
+        )
         body_sha256 = hashlib.sha256(canonical_body.encode('utf-8')).hexdigest()
 
     # POST/PUT MUST have body for signature verification
@@ -353,8 +364,16 @@ def build_signed_envelope(
     if query:
         envelope["query"] = query
 
-    # Canonicalize envelope for signing - MUST use exact same pattern
-    envelope_json = json.dumps(envelope, separators=(',', ':'), sort_keys=True)
+    # Canonicalize the envelope for signing. The gateway decodes the
+    # envelope header, re-serializes it with json.dumps(obj,
+    # separators=(",", ":"), sort_keys=True, ensure_ascii=False), encodes
+    # that as UTF-8, and verifies the signature over those bytes — so the
+    # client must sign exactly that byte stream. ensure_ascii=True would
+    # produce different bytes for any non-ASCII envelope value and break
+    # verification.
+    envelope_json = json.dumps(
+        envelope, separators=(',', ':'), sort_keys=True, ensure_ascii=False,
+    )
 
     # Sign the canonical envelope bytes
     signature = signer.sign(envelope_json.encode('utf-8'))
@@ -409,7 +428,10 @@ def build_unsigned_envelope(
             body-only endpoints.
         ops: Required operations (e.g., ["locker:write"]).
         body: Request body dict for POST/PUT (will be canonicalized).
-        ttl_seconds: Envelope validity duration (default 5 minutes).
+        ttl_seconds: Envelope validity duration (default 5 minutes). The
+            gateway caps envelope TTL at 300 seconds and rejects longer
+            windows with ENVELOPE_TTL_TOO_LONG, so do not raise this above
+            the default.
         delegating: If True, include signer identity in the envelope
             (operator acting on behalf of owner).
 
@@ -438,7 +460,11 @@ def build_unsigned_envelope(
                     "build_unsigned_envelope: 'body' must be valid JSON if provided as string. "
                     f"Received: {body[:100]}..."
                 )
-        canonical_body = json.dumps(body, separators=(',', ':'), sort_keys=True)
+        # Same canonical formula as build_signed_envelope: the gateway
+        # re-serializes with ensure_ascii=False and hashes the UTF-8 bytes.
+        canonical_body = json.dumps(
+            body, separators=(',', ':'), sort_keys=True, ensure_ascii=False,
+        )
         body_sha256 = hashlib.sha256(canonical_body.encode('utf-8')).hexdigest()
 
     if method.upper() in ('POST', 'PUT') and canonical_body is None:
@@ -474,7 +500,11 @@ def build_unsigned_envelope(
     if query:
         envelope["query"] = query
 
-    envelope_json = json.dumps(envelope, separators=(',', ':'), sort_keys=True)
+    # The external signer must sign exactly the bytes the gateway will
+    # re-canonicalize: json.dumps with ensure_ascii=False, encoded as UTF-8.
+    envelope_json = json.dumps(
+        envelope, separators=(',', ':'), sort_keys=True, ensure_ascii=False,
+    )
     envelope_b64 = base64.urlsafe_b64encode(
         envelope_json.encode('utf-8')
     ).decode().rstrip('=')

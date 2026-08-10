@@ -11,7 +11,7 @@ import mimetypes
 import os
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from .errors import NukezError
 
@@ -35,6 +35,43 @@ def _is_gateway_short_url(url: str) -> bool:
     except Exception:
         return False
     return parsed.path.startswith("/f/")
+
+
+def _validated_confirm_url(
+    confirm_url: str, expected_path: str, base_url: str
+) -> Optional[str]:
+    """Validate a server-supplied confirm URL before an envelope binds to it.
+
+    The confirm URL arrives inside a create_file/create_files_batch response,
+    and the confirm step signs a payer envelope over whatever path and query
+    the URL carries. Trusting the URL blindly would let a poisoned create
+    response obtain a payer-signed ``locker:write`` envelope for an arbitrary
+    gateway path, so this helper only accepts a URL whose path is exactly
+    ``expected_path`` and whose host is either empty (a relative URL) or
+    exactly the host of the client's configured ``base_url``. For absolute
+    URLs the scheme must match the base URL's scheme as well, so a matching
+    host cannot be combined with a downgraded transport.
+
+    Returns the URL unchanged when it passes every check, and ``None`` on any
+    mismatch so the caller falls back to the client-constructed request — the
+    client must never sign a path it did not choose.
+    """
+    try:
+        parts = urlsplit(confirm_url)
+    except Exception:
+        return None
+    if parts.path != expected_path:
+        return None
+    if not parts.netloc and not parts.scheme:
+        # A relative URL cannot redirect the request to another host, and its
+        # path has already been checked, so it is safe to sign.
+        return confirm_url
+    base = urlsplit(base_url)
+    if parts.netloc.lower() != base.netloc.lower():
+        return None
+    if parts.scheme.lower() != base.scheme.lower():
+        return None
+    return confirm_url
 
 # ---------------------------------------------------------------------------
 # Constants

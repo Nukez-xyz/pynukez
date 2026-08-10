@@ -452,6 +452,38 @@ class TestAsyncBatchOperations:
         assert result.total == 1
         assert result.uploaded >= 0  # May be 0 or 1 depending on implementation details
 
+    async def test_upload_files_counts_confirm_failure_as_failed(self, async_client):
+        """A confirm failure must surface as a per-file failure. Routine
+        attestation trusts the manifest's recorded content_hash and does not
+        recompute hashes, so a swallowed confirm failure would leave the file
+        unverified forever while reporting an upload success."""
+        from pynukez.errors import NukezError
+
+        async_client.create_file = AsyncMock(return_value=MagicMock(
+            upload_url="https://storage.example/upload",
+        ))
+        async_client.upload_bytes = AsyncMock(return_value=MagicMock())
+
+        async def _confirm(receipt_id, fname):
+            if fname == "b.txt":
+                raise NukezError("confirm exploded")
+            return MagicMock()
+
+        async_client.confirm_file = AsyncMock(side_effect=_confirm)
+
+        files = [
+            {"filename": "a.txt", "content": b"aa"},
+            {"filename": "b.txt", "content": b"bb"},
+        ]
+        result = await async_client.upload_files("r1", files, workers=1)
+
+        assert result.total == 2
+        assert result.uploaded == 1
+        assert result.failed == 1
+        errors = dict(result.errors)
+        assert "b.txt" in errors
+        assert "confirm exploded" in errors["b.txt"]
+
 
 class TestAsyncKeypairDualInit:
     """Keypair is still initialized when signing_key is injected."""

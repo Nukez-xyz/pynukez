@@ -32,10 +32,12 @@ from .errors import (
     OperatorConflictError,
 )
 from .types import SplTransfer
+from ._version import __version__
 
-# Standard headers shared by sync and async clients
+# Standard headers shared by sync and async clients. The User-Agent string
+# derives from the package version so the two can never drift apart again.
 STANDARD_HEADERS = {
-    "User-Agent": "nukez-sdk/4.0.21",
+    "User-Agent": f"nukez-sdk/{__version__}",
     "Accept": "application/json",
     "Content-Type": "application/json",
 }
