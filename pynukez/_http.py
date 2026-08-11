@@ -22,6 +22,7 @@ from .errors import (
     TransactionNotFoundError,
     AuthenticationError,
     NukezFileNotFoundError,
+    NukezNotProvisionedError,
     URLExpiredError,
     RateLimitError,
     InvalidOperatorPubkeyError,
@@ -377,6 +378,20 @@ def handle_error_response(response) -> None:
             filename = error_details.get("filename", "unknown")
             locker_id = error_details.get("locker_id", "")
             raise NukezFileNotFoundError(filename=filename, locker_id=locker_id)
+
+        # A 404 whose error code names the locker means the locker itself
+        # does not exist yet — the receipt is real but provision_locker()
+        # has not been called. This wires up NukezNotProvisionedError,
+        # which was exported but unreachable before 2026-08-10; it is a
+        # NukezError subclass, so callers catching the previous generic
+        # NukezError here keep working.
+        if "locker" in error_code:
+            receipt_id = (
+                error_details.get("receipt_id")
+                or error_details.get("details", {}).get("receipt_id")
+                or ""
+            )
+            raise NukezNotProvisionedError(receipt_id=receipt_id)
 
         # Use response.url.path (not full URL) to avoid leaking query-string
         # credentials like receipt_id from confirm_url.

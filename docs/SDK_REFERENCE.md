@@ -1154,13 +1154,24 @@ print(instructions["quickstart_flow"])
 
 ## Environment Variables
 
+These are the environment variables the library actually reads. (Earlier
+revisions of this document also listed `NUKEZ_NETWORK`, `NUKEZ_KEYPAIR_PATH`,
+and `NUKEZ_WALLET_PATH`; the code has never read any of them — the network
+and keypair path are constructor arguments, not environment variables.)
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NUKEZ_BASE_URL` | `https://api.nukez.xyz` | Gateway API URL |
-| `NUKEZ_NETWORK` | `devnet` | Default network |
-| `NUKEZ_KEYPAIR_PATH` | -- | Ed25519 keypair path |
-| `NUKEZ_WALLET_PATH` | -- | Alternative keypair path |
 | `PYNUKEZ_UPLOAD_STRING_MAX_BYTES` | `262144` (256 KB) | Max upload_string size |
+| `PYNUKEZ_SANDBOX_INGEST_PART_BYTES` | `196608` (192 KB) | Sandbox-ingest part size for chunked uploads |
+| `PYNUKEZ_SANDBOX_EXECUTION_MODE` | `sandbox` | Execution mode sent with sandbox-ingest sessions |
+
+A note on the async client: twelve public methods on `AsyncNukez` are
+deliberately synchronous because they perform no I/O — `bind_receipt`,
+`set_owner`, `compute_hash`, `get_provider_info`, and the viewer URL,
+handoff, and contract builders. Call them without `await`; awaiting them
+raises `TypeError`. Every other public method on the async client is
+awaitable.
 
 ---
 

@@ -109,6 +109,15 @@ class AsyncNukez:
     Mirrors the sync ``Nukez`` class exactly — every public method that
     performs I/O is ``async def``.  Pure-computation helpers are sync.
 
+    Twelve public methods are deliberately synchronous because they do no
+    I/O, and awaiting them raises TypeError. Call these without ``await``:
+    ``bind_receipt``, ``set_owner``, ``compute_hash``, ``get_provider_info``,
+    ``get_viewer_container_url``, ``get_viewer_container_handoff``,
+    ``get_owner_viewer_url``, ``get_file_viewer_url``,
+    ``get_owner_viewer_handoff``, ``get_viewer_renderer_contract``,
+    ``get_viewer_container_contract``, and ``get_file_viewer_handoff``.
+    Everything else on this class is awaitable.
+
     Usage:
         async with AsyncNukez(keypair_path="~/.config/solana/id.json") as client:
             request = await client.request_storage(units=1)

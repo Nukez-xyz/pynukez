@@ -570,7 +570,7 @@ class Nukez:
                       after your first call rather than guessing.
 
                       Symbols currently returned by the gateway:
-                        Solana:          SOL, USDC, USDT
+                        Solana:          SOL, USDC, USDT, WETH, BETA
                         Monad (EVM):     MON, USDC, USDT0, WETH
 
                       Note: Monad returns `USDT0` (Tether USD₀), not `USDT`.

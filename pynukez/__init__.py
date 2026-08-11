@@ -183,7 +183,6 @@ __all__ = [
     "attach_signature",
     "compute_locker_id",
     "infer_sig_alg",
-    "SignedEnvelope",
     "UnsignedEnvelope",
     
     # Discovery utilities
