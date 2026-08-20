@@ -46,7 +46,7 @@ Requires Python 3.9+. Supported on macOS, Linux, and Windows.
 
 | Group | Packages |
 |-------|----------|
-| **Core (runtime)** | `httpx>=0.24.0`, `pynacl>=1.5.0`, `base58>=2.1.0`, `eth-account>=0.10.0` |
+| **Core (runtime)** | `httpx>=0.24.0`, `pynacl>=1.5.0`, `base58>=2.1.0`, `eth-account>=0.10.0`, `google-crc32c>=1.5.0` |
 | **[dev]** | `pytest`, `pytest-asyncio`, `pytest-mock`, `black`, `isort`, `mypy`, `python-dotenv` |
 | **dev** | `pytest`, `pytest-asyncio`, `pytest-mock`, `black`, `isort`, `mypy` |
 
@@ -360,6 +360,7 @@ urls.expires_in_sec # URL lifetime
 | `bulk_upload_paths(receipt_id, sources, workers=6, ttl_min=30, confirm=True, auto_attest=False, attest_sync=False, on_progress=None)` | Multiple local files | Parallel upload with batch confirm |
 | `upload_directory(receipt_id, source_dir, pattern="*", recursive=False, exclude_pattern=None, preserve_structure=False, workers=6, ...)` | Directories | Glob-filtered directory upload |
 | `upload_files(receipt_id, sources, workers=6, ttl_min=30, confirm=True)` | General batch | Concurrent upload from source list |
+| `upload_large_file(receipt_id, filepath, filename=None, content_type=None, ttl_min=30, chunk_bytes=8 MiB, confirm=True, auto_attest=False, push_attestation=False, threshold_bytes=256 MiB, on_progress=None, ...)` | Large files (any size) | Resumable direct-to-provider upload with streaming digests |
 
 ```python
 # Direct bytes
@@ -388,6 +389,48 @@ result = client.upload_directory(
     recursive=True,
 )
 ```
+
+### Large Files: Resumable Direct-to-Provider Uploads
+
+For large objects, `upload_large_file()` moves the bytes straight from disk
+to the storage provider in a resumable session — they never pass through the
+gateway, the model's context, or client memory as a whole. The flow: one
+streaming pass computes the file's SHA-256 and CRC32C; the create call
+pre-commits both hash and size; the file is uploaded in aligned chunks
+(default 8 MiB) that resume from the provider's committed offset after any
+interruption; the final chunk carries the whole-object CRC32C so the
+provider itself refuses a corrupted transfer; and confirmation makes the
+gateway stream the stored object and record the verified hash.
+
+Confirmation routes by size: below `threshold_bytes` (default 256 MiB) the
+ordinary synchronous confirm runs; at or above it — or whenever
+`auto_attest`/`push_attestation` is requested — the gateway's asynchronous
+finalize-upload job runs the confirm (and optional attestation) off the
+request path, and the method polls the job to completion. Practical
+ceilings: the synchronous path is comfortable to roughly 10 GB and a single
+job dispatch to roughly 50-100 GB; beyond that is deliberately unsupported
+for now.
+
+`upload_file_path()` and `bulk_upload_paths()` route files at or above the
+threshold through this path automatically, so existing callers gain
+streaming and resumability with no API change.
+
+```python
+result = client.upload_large_file(
+    receipt.id,
+    "/path/to/dataset.bin",
+    on_progress=lambda done, total: print(f"{done}/{total} bytes committed"),
+)
+print(result["sha256"], result["confirm_path"], result["resume_count"])
+```
+
+The two job primitives are also available directly when you manage the
+confirm step yourself:
+
+| Method | Description |
+|--------|-------------|
+| `finalize_upload_job(receipt_id, filenames, auto_attest=False, attest_sync=False, push_attestation=False, run_inline=False)` | Create the gateway's asynchronous confirm-and-attest job for already-uploaded files |
+| `get_job(job_id, receipt_id)` | Poll a job to its terminal state (`complete`, `partial`, or `failed`) |
 
 ### Background Upload Jobs
 

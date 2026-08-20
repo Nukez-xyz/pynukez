@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pynukez"
-version = "4.0.23"
+version = "4.0.24"
 description = "Nukez SDK — agent-native storage with cryptographic verification"
 readme = "README.md"
 license = {text = "MIT"}
@@ -45,6 +45,12 @@ dependencies = [
     "pynacl>=1.5.0",
     "base58>=2.1.0",
     "eth-account>=0.10.0",
+    # Whole-object CRC32C for large-blob resumable uploads: the final chunk
+    # carries x-goog-hash so the storage provider itself refuses to commit a
+    # corrupted transfer. The SDK degrades gracefully without it (the
+    # gateway's streaming hash at confirm still verifies integrity), but as
+    # a hard dependency every install gets the provider-side transport check.
+    "google-crc32c>=1.5.0",
 ]
 
 [project.optional-dependencies]

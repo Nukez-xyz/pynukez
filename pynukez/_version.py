@@ -7,4 +7,4 @@ value together with the ``version`` field in ``pyproject.toml`` when
 releasing.
 """
 
-__version__ = "4.0.23"
+__version__ = "4.0.24"

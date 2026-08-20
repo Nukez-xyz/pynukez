@@ -115,6 +115,7 @@ async with AsyncNukez(
 | Setup locker | `client.provision_locker(receipt.id)` |
 | Store bytes | `urls = client.create_file(receipt.id, "file.txt")` then `client.upload_bytes(urls.upload_url, data)` |
 | Store file | `client.upload_file_path(receipt.id, "/path/to/file.pdf")` |
+| Store large file | `client.upload_large_file(receipt.id, "/path/to/dataset.bin")` — resumable, direct to storage, any size |
 | Batch upload | `client.bulk_upload_paths(receipt.id, [{"filepath": "a.pdf"}, {"filepath": "b.txt"}])` |
 | Store directory | `client.upload_directory(receipt.id, "/path/to/dir", pattern="*.pdf", recursive=True)` |
 | Confirm hash | `client.confirm_file(receipt.id, "file.txt", confirm_url=urls.confirm_url)` |

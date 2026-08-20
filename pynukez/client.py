@@ -24,7 +24,7 @@ logger = logging.getLogger("pynukez.client")
 import httpx as _httpx
 from pathlib import Path
 from typing import Dict, List, Optional, Union, Any, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict as _dc_asdict, is_dataclass as _dc_is_dataclass
 from urllib.parse import urlencode, urlsplit
 from .types import (
     StorageRequest,
@@ -106,6 +106,22 @@ VIEWER_CONTAINER_CONTRACT_VERSION = "1.0.0"
 SANDBOX_INGEST_DEFAULT_PART_BYTES = int(os.getenv("PYNUKEZ_SANDBOX_INGEST_PART_BYTES", "196608"))
 SANDBOX_INGEST_MAX_PART_BYTES = 512 * 1024
 SANDBOX_INGEST_MIN_PART_BYTES = 4 * 1024
+
+# ── Large-blob resumable uploads (gateway 2026-08 design) ─────────────────
+# At or above the threshold, upload_large_file() finalizes through the
+# gateway's asynchronous finalize-upload job instead of the synchronous
+# confirm, so the request path never carries a hash pass proportional to the
+# object size. Below it, the ordinary synchronous confirm is used. The
+# resumable chunk size must be a multiple of the provider's 256 KiB
+# alignment; 8 MiB balances throughput against retransmission cost.
+LARGE_UPLOAD_THRESHOLD_BYTES = int(
+    os.getenv("PYNUKEZ_LARGE_UPLOAD_THRESHOLD_BYTES", str(256 * 1024 * 1024))
+)
+RESUMABLE_CHUNK_BYTES = int(
+    os.getenv("PYNUKEZ_RESUMABLE_CHUNK_BYTES", str(8 * 1024 * 1024))
+)
+RESUMABLE_CHUNK_ALIGN_BYTES = 256 * 1024
+RESUMABLE_MAX_RESUME_ATTEMPTS = 5
 SANDBOX_INGEST_EXECUTION_MODE = os.getenv("PYNUKEZ_SANDBOX_EXECUTION_MODE", "sandbox")
 
 
@@ -1103,21 +1119,36 @@ class Nukez:
         )
 
     def create_file(
-        self, 
-        receipt_id: str, 
+        self,
+        receipt_id: str,
         filename: str,
         content_type: str = "application/octet-stream",
-        ttl_min: int = 30
+        ttl_min: int = 30,
+        expected_hash: Optional[str] = None,
+        expected_size_bytes: Optional[int] = None,
+        upload_mode: Optional[str] = None,
     ) -> FileUrls:
         """
         Create a new file and get upload/download URLs.
-        
+
         Args:
             receipt_id: Receipt ID from confirm_storage()
             filename: Name for the file
             content_type: MIME type (default: application/octet-stream)
             ttl_min: URL expiration time in minutes (default: 30)
-            
+            expected_hash: Optional SHA-256 pre-commitment (with or without
+                the "sha256:" prefix). The gateway records it and refuses to
+                confirm the upload unless the stored bytes hash to it.
+            expected_size_bytes: Optional declared object size. The gateway
+                rejects it up front when it exceeds the provider's object
+                limit, and confirm refuses to record the manifest hash when
+                the stored byte count disagrees (409 SIZE_MISMATCH).
+            upload_mode: None or "put" for the ordinary single signed PUT;
+                "resumable" additionally asks the gateway to mint a
+                resumable-session opener for large objects (the provider
+                must support it; GCS does). Only sent when set, so requests
+                to older gateways are byte-identical to before.
+
         Returns:
             FileUrls with:
             - filename: The file name
@@ -1125,16 +1156,27 @@ class Nukez:
             - download_url: GET data from here
             - content_type: MIME type
             - expires_in_sec: URL validity duration
+            - resumable_upload: session-opener block when upload_mode was
+              "resumable" and the gateway supports it (None otherwise)
         """
         signer = self._require_signer("create_file", receipt_id)
         locker_id = compute_locker_id(receipt_id)
-        
+
         body = {
             "filename": filename,
             "content_type": content_type,
             "ttl_min": ttl_min
         }
-        
+        # The envelope binds the canonical body, so optional fields are
+        # included only when set: an unset option keeps the wire body (and
+        # therefore the signature input) identical to older SDK versions.
+        if expected_hash:
+            body["expected_hash"] = expected_hash
+        if expected_size_bytes is not None:
+            body["expected_size_bytes"] = int(expected_size_bytes)
+        if upload_mode:
+            body["upload_mode"] = upload_mode
+
         envelope = build_signed_envelope(
             signer=signer,
             receipt_id=receipt_id,
@@ -1144,13 +1186,13 @@ class Nukez:
             body=body,
             delegating=self._is_delegating(receipt_id),
         )
-        
+
         response = self.http.post(
             f"/v1/lockers/{locker_id}/files",
             headers=envelope.headers,
             data=envelope.canonical_body.encode("utf-8"),
         )
-        
+
         urls = FileUrls(
             filename=response.get("filename", filename),
             upload_url=response["upload_url"],
@@ -1158,6 +1200,10 @@ class Nukez:
             content_type=response.get("content_type", content_type),
             expires_in_sec=response.get("urls_expire_in_sec", ttl_min * 60),
             confirm_url=response.get("confirm_url"),
+            upload_mode=response.get("upload_mode"),
+            resumable_upload=response.get("resumable_upload"),
+            expected_hash=response.get("expected_hash"),
+            expected_size_bytes=response.get("expected_size_bytes"),
         )
         return urls
 
@@ -1297,6 +1343,12 @@ class Nukez:
     ) -> Dict[str, Any]:
         """
         Upload one local file by path without passing file bytes through LLM context.
+
+        Files at or above LARGE_UPLOAD_THRESHOLD_BYTES (default 256 MiB)
+        are automatically routed through upload_large_file() — the
+        resumable direct-to-provider path with streaming digests — via the
+        underlying bulk_upload_paths() routing, so callers get streaming
+        and resumability for big files with no API change.
         """
         source: Dict[str, Any] = {"filepath": filepath}
         if filename:
@@ -1365,6 +1417,22 @@ class Nukez:
         normalized = self._normalize_path_sources(sources)
         t0 = time.time()
 
+        # Large-blob routing: files at or above the threshold go through
+        # upload_large_file() — the resumable direct-to-provider path with
+        # streaming digests and job-based confirm — instead of being read
+        # whole into memory and PUT in one shot. They are excluded from the
+        # batch create (upload_large_file performs its own resumable-mode
+        # create with hash and size pre-commitment) and from the batch
+        # confirm (their confirm runs inside the finalize job, and a batch
+        # confirm would put an object-sized hash pass back on the request
+        # path).
+        for s in normalized:
+            try:
+                s["_size_bytes"] = os.path.getsize(s["filepath"])
+            except OSError:
+                s["_size_bytes"] = 0
+            s["_is_large"] = s["_size_bytes"] >= LARGE_UPLOAD_THRESHOLD_BYTES
+
         create_specs = [
             {
                 "filename": s["filename"],
@@ -1372,11 +1440,16 @@ class Nukez:
                 "expected_hash": s.get("expected_hash"),
             }
             for s in normalized
+            if not s["_is_large"]
         ]
-        create_response = self.create_files_batch(
-            receipt_id=receipt_id,
-            files=create_specs,
-            ttl_min=ttl_min,
+        create_response = (
+            self.create_files_batch(
+                receipt_id=receipt_id,
+                files=create_specs,
+                ttl_min=ttl_min,
+            )
+            if create_specs
+            else {"files": []}
         )
 
         url_by_filename = {
@@ -1391,6 +1464,45 @@ class Nukez:
 
         def _upload_one(spec: Dict[str, Any]) -> Dict[str, Any]:
             filename = spec["filename"]
+
+            if spec.get("_is_large"):
+                try:
+                    large = self.upload_large_file(
+                        receipt_id,
+                        spec["filepath"],
+                        filename=filename,
+                        content_type=spec["content_type"],
+                        ttl_min=ttl_min,
+                        confirm=confirm,
+                    )
+                    confirmed_hash = ""
+                    if large.get("confirm_path") == "sync":
+                        confirmed_hash = (large.get("confirm") or {}).get("content_hash", "")
+                    elif large.get("confirm_path") == "job":
+                        confirmed_hash = f"sha256:{large['sha256']}"
+                    return {
+                        "filename": large.get("filename", filename),
+                        "filepath": spec["filepath"],
+                        "content_type": spec["content_type"],
+                        "size_bytes": large.get("size_bytes", spec.get("_size_bytes", 0)),
+                        "success": True,
+                        "error": "",
+                        "large_upload": True,
+                        "confirmed": confirm,
+                        "content_hash": confirmed_hash,
+                        "resume_count": large.get("resume_count", 0),
+                    }
+                except Exception as e:
+                    return {
+                        "filename": filename,
+                        "filepath": spec["filepath"],
+                        "content_type": spec["content_type"],
+                        "size_bytes": spec.get("_size_bytes", 0),
+                        "success": False,
+                        "error": str(e),
+                        "large_upload": True,
+                    }
+
             entry = url_by_filename.get(filename)
             if not entry:
                 return {
@@ -1435,8 +1547,13 @@ class Nukez:
             for idx, fut in enumerate(as_completed(futures), 1):
                 row = fut.result()
                 file_results.append(row)
-                if row["success"]:
+                if row["success"] and not row.get("large_upload"):
                     uploaded_names.append(row["filename"])
+                elif row["success"]:
+                    # Large uploads confirm inside upload_large_file (sync or
+                    # finalize job); adding them to the batch confirm would
+                    # re-run an object-sized hash pass on the request path.
+                    pass
                 else:
                     errors.append(
                         {
@@ -1468,6 +1585,13 @@ class Nukez:
 
         confirmed_count = 0
         for row in file_results:
+            if row.get("large_upload"):
+                # Confirmed (or deliberately skipped) inside
+                # upload_large_file; the row already carries its own
+                # confirmed flag and content_hash.
+                if row.get("confirmed"):
+                    confirmed_count += 1
+                continue
             if row["success"] and row["filename"] in confirmed_map:
                 c = confirmed_map[row["filename"]]
                 row["content_hash"] = c.content_hash
@@ -1481,7 +1605,10 @@ class Nukez:
                 row["confirmed"] = False
 
         attestation: Optional[Dict[str, Any]] = None
-        if auto_attest and uploaded_names:
+        any_uploaded = bool(uploaded_names) or any(
+            r.get("large_upload") and r.get("success") for r in file_results
+        )
+        if auto_attest and any_uploaded:
             try:
                 att = self.attest(receipt_id, sync=attest_sync)
                 attestation = {
@@ -1512,6 +1639,398 @@ class Nukez:
             "errors": errors,
             "attestation": attestation,
         }
+
+    # ──────────────────────────────────────────────────────────────────
+    # Large-blob resumable uploads (gateway 2026-08 design)
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _stream_file_digests(filepath: str, chunk_bytes: int = 4 * 1024 * 1024):
+        """One streaming pass over a file computing size, SHA-256, and
+        (when the optional google-crc32c package is installed) the
+        base64-encoded whole-object CRC32C. Returns (size, sha256_hex,
+        crc32c_b64_or_None). Memory use is one chunk regardless of size."""
+        sha = hashlib.sha256()
+        crc = None
+        try:
+            import google_crc32c  # type: ignore
+            crc = google_crc32c.Checksum()
+        except Exception:
+            crc = None
+        size = 0
+        with open(filepath, "rb") as fh:
+            while True:
+                block = fh.read(chunk_bytes)
+                if not block:
+                    break
+                sha.update(block)
+                if crc is not None:
+                    crc.update(block)
+                size += len(block)
+        crc_b64 = base64.b64encode(crc.digest()).decode() if crc is not None else None
+        return size, sha.hexdigest(), crc_b64
+
+    def _resumable_open_session(self, resumable_block: Dict[str, Any]) -> str:
+        """POST once to the gateway-minted session opener and return the
+        provider session URI from the Location header. The opener URL, its
+        method, and its headers are signed by the gateway; they must be
+        sent exactly as given."""
+        url = resumable_block.get("url") or ""
+        headers = dict(resumable_block.get("headers") or {})
+        if not url:
+            raise NukezError("resumable_upload block carries no session-opener url")
+        resp = self._raw_client.request(
+            (resumable_block.get("method") or "POST").upper(), url,
+            headers=headers, content=b"",
+        )
+        if resp.status_code not in (200, 201):
+            raise NukezError(
+                f"resumable session open failed: HTTP {resp.status_code} "
+                f"{resp.text[:200]}"
+            )
+        session_uri = resp.headers.get("Location") or resp.headers.get("location")
+        if not session_uri:
+            raise NukezError(
+                "resumable session open returned no Location header; "
+                "cannot continue"
+            )
+        return session_uri
+
+    def _resumable_committed_offset(self, session_uri: str, total_size: int) -> int:
+        """Ask the provider how many bytes it has committed for a session
+        (an empty PUT with 'Content-Range: bytes */total'). Returns the
+        next byte offset to send: 0 when nothing is committed, total_size
+        when the object is already complete."""
+        resp = self._raw_client.put(
+            session_uri, content=b"",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+        if resp.status_code in (200, 201):
+            return total_size
+        rng = resp.headers.get("Range") or resp.headers.get("range") or ""
+        if resp.status_code == 308:
+            if not rng:
+                return 0
+            try:
+                return int(rng.split("-")[-1]) + 1
+            except ValueError:
+                raise NukezError(f"unparseable committed Range header: {rng!r}")
+        raise NukezError(
+            f"resumable status query failed: HTTP {resp.status_code} {resp.text[:200]}"
+        )
+
+    def upload_large_file(
+        self,
+        receipt_id: str,
+        filepath: str,
+        filename: Optional[str] = None,
+        content_type: Optional[str] = None,
+        ttl_min: int = 30,
+        chunk_bytes: int = RESUMABLE_CHUNK_BYTES,
+        confirm: bool = True,
+        auto_attest: bool = False,
+        push_attestation: bool = False,
+        threshold_bytes: int = LARGE_UPLOAD_THRESHOLD_BYTES,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        job_poll_interval: float = 3.0,
+        job_timeout: float = 900.0,
+    ) -> Dict[str, Any]:
+        """
+        Upload one local file of any size through the resumable
+        direct-to-provider path, then confirm it.
+
+        The flow, matching the gateway's large-blob design: one streaming
+        pass computes the file's SHA-256 (and CRC32C when google-crc32c is
+        installed); create_file pre-commits hash and size with
+        upload_mode="resumable"; the returned session opener is POSTed once
+        for a provider session URI; the file is PUT in aligned chunks read
+        from disk (never held whole in memory), resuming from the
+        provider's committed offset after any interruption; the final chunk
+        carries the whole-object CRC32C so the provider itself rejects a
+        corrupted transfer; and confirmation then makes the gateway stream
+        the stored object and record the verified hash.
+
+        Confirm routing: below ``threshold_bytes`` (default 256 MiB) the
+        synchronous confirm is used. At or above it — or whenever
+        ``auto_attest``/``push_attestation`` is requested — the gateway's
+        asynchronous finalize-upload job runs the confirm (and optional
+        attestation) off the request path, and this method polls the job to
+        a terminal state. Practical ceilings: the synchronous path is
+        comfortable to roughly 10 GB; a single job dispatch to roughly
+        50-100 GB. Beyond that is deliberately unsupported for now.
+
+        Auth: every gateway call signs a payer envelope (locker:write for
+        create/confirm/job creation, locker:read for job polling), so the
+        client must be configured with a signing key. The provider session
+        URI is itself the transfer credential and needs no further auth.
+
+        Args:
+            receipt_id: Receipt ID from confirm_storage().
+            filepath: Local path of the file to upload.
+            filename: Stored name; defaults to the path's basename.
+            content_type: MIME type; inferred from the name when omitted.
+            ttl_min: Lifetime of the minted URLs in minutes.
+            chunk_bytes: Chunk size; must be a positive multiple of the
+                provider's 256 KiB alignment.
+            confirm: When False, upload only — the caller owns confirm.
+            auto_attest: Run attestation in the finalize job after confirm.
+            push_attestation: Also push the attestation on-chain (implies
+                the job path).
+            threshold_bytes: Size at which confirm moves to the job path.
+            on_progress: Optional callback (bytes_committed, total_bytes)
+                invoked after each committed chunk.
+            job_poll_interval: Seconds between job status polls.
+            job_timeout: Maximum seconds to wait for the finalize job.
+
+        Returns:
+            Dict with filename, size_bytes, sha256, crc32c_base64,
+            chunks_sent, resume_count, confirm_path ("sync" | "job" |
+            "skipped"), and either confirm (the sync confirm response) or
+            job (the terminal job state).
+        """
+        path = Path(filepath).expanduser()
+        if not path.is_file():
+            raise NukezError(f"upload_large_file: file not found: {path}")
+        if chunk_bytes <= 0 or chunk_bytes % RESUMABLE_CHUNK_ALIGN_BYTES != 0:
+            raise NukezError(
+                "chunk_bytes must be a positive multiple of "
+                f"{RESUMABLE_CHUNK_ALIGN_BYTES} (got {chunk_bytes})"
+            )
+
+        name = self._sanitize_filename(filename or path.name)
+        ctype = self._infer_content_type(name, content_type)
+
+        # Pass 1: digests (streaming; the upload re-reads from disk by
+        # offset, so the whole file is never resident in memory).
+        total_size, sha_hex, crc_b64 = self._stream_file_digests(str(path))
+        if total_size == 0:
+            raise NukezError("upload_large_file: refusing to upload an empty file")
+
+        urls = self.create_file(
+            receipt_id, name,
+            content_type=ctype, ttl_min=ttl_min,
+            expected_hash=f"sha256:{sha_hex}",
+            expected_size_bytes=total_size,
+            upload_mode="resumable",
+        )
+        block = urls.resumable_upload
+        if not block:
+            raise NukezError(
+                "The gateway did not return a resumable_upload block. Either "
+                "the deployed gateway predates resumable uploads or the "
+                "locker's storage provider does not support them; use "
+                "upload_file_path() (single signed PUT) instead."
+            )
+
+        session_uri = self._resumable_open_session(block)
+
+        # Pass 2: chunked transfer with resume-on-failure.
+        offset = 0
+        chunks_sent = 0
+        resume_count = 0
+        final_resp = None
+        with open(path, "rb") as fh:
+            while offset < total_size:
+                end = min(offset + chunk_bytes, total_size) - 1
+                fh.seek(offset)
+                data = fh.read(end - offset + 1)
+                headers = {
+                    "Content-Range": f"bytes {offset}-{end}/{total_size}",
+                    "Content-Type": ctype,
+                }
+                is_final = end == total_size - 1
+                if is_final and crc_b64:
+                    # The provider validates the whole-object checksum at
+                    # finalize and refuses to commit a corrupted transfer.
+                    headers["x-goog-hash"] = f"crc32c={crc_b64}"
+                try:
+                    resp = self._raw_client.put(session_uri, content=data, headers=headers)
+                except _httpx.HTTPError as exc:
+                    resume_count += 1
+                    if resume_count > RESUMABLE_MAX_RESUME_ATTEMPTS:
+                        raise NukezError(
+                            f"resumable upload failed after "
+                            f"{RESUMABLE_MAX_RESUME_ATTEMPTS} resume attempts: {exc}"
+                        ) from exc
+                    time.sleep(min(2.0 * resume_count, 10.0))
+                    offset = self._resumable_committed_offset(session_uri, total_size)
+                    continue
+
+                if resp.status_code == 308:
+                    rng = resp.headers.get("Range") or ""
+                    try:
+                        offset = int(rng.split("-")[-1]) + 1 if rng else offset
+                    except ValueError:
+                        offset = self._resumable_committed_offset(session_uri, total_size)
+                    chunks_sent += 1
+                    if on_progress:
+                        try:
+                            on_progress(offset, total_size)
+                        except Exception:
+                            pass
+                    continue
+                if resp.status_code in (200, 201):
+                    chunks_sent += 1
+                    final_resp = resp
+                    offset = total_size
+                    if on_progress:
+                        try:
+                            on_progress(offset, total_size)
+                        except Exception:
+                            pass
+                    break
+                if resp.status_code in (408, 429, 500, 502, 503, 504):
+                    resume_count += 1
+                    if resume_count > RESUMABLE_MAX_RESUME_ATTEMPTS:
+                        raise NukezError(
+                            f"resumable upload failed after "
+                            f"{RESUMABLE_MAX_RESUME_ATTEMPTS} resume attempts: "
+                            f"HTTP {resp.status_code} {resp.text[:200]}"
+                        )
+                    time.sleep(min(2.0 * resume_count, 10.0))
+                    offset = self._resumable_committed_offset(session_uri, total_size)
+                    continue
+                raise NukezError(
+                    f"resumable chunk PUT failed: HTTP {resp.status_code} "
+                    f"{resp.text[:300]}"
+                )
+
+        # Cross-check the provider's committed object against local truth
+        # before confirming: a size or checksum disagreement here means the
+        # transfer itself went wrong and confirm would only fail later.
+        if final_resp is not None:
+            try:
+                resource = final_resp.json()
+            except Exception:
+                resource = {}
+            stored_size = int(resource.get("size") or 0)
+            if stored_size and stored_size != total_size:
+                raise NukezError(
+                    f"provider committed {stored_size} bytes but the local "
+                    f"file is {total_size} bytes"
+                )
+            stored_crc = resource.get("crc32c")
+            if stored_crc and crc_b64 and stored_crc != crc_b64:
+                raise NukezError(
+                    f"provider CRC32C {stored_crc!r} does not match the "
+                    f"locally computed {crc_b64!r}"
+                )
+
+        result: Dict[str, Any] = {
+            "filename": name,
+            "size_bytes": total_size,
+            "sha256": sha_hex,
+            "crc32c_base64": crc_b64,
+            "upload_mode": "resumable",
+            "chunks_sent": chunks_sent,
+            "resume_count": resume_count,
+        }
+
+        if not confirm:
+            result["confirm_path"] = "skipped"
+            return result
+
+        use_job = (
+            total_size >= threshold_bytes or auto_attest or push_attestation
+        )
+        if not use_job:
+            confirmed = self.confirm_file(receipt_id, name)
+            result["confirm_path"] = "sync"
+            result["confirm"] = (
+                _dc_asdict(confirmed) if _dc_is_dataclass(confirmed) else confirmed
+            )
+            return result
+
+        job = self.finalize_upload_job(
+            receipt_id, [name],
+            auto_attest=auto_attest,
+            push_attestation=push_attestation,
+        )
+        job_id = str(job.get("job_id") or "")
+        if not job_id:
+            raise NukezError(f"finalize-upload job creation returned no job_id: {job}")
+        deadline = time.time() + job_timeout
+        terminal = job
+        while time.time() < deadline:
+            terminal = self.get_job(job_id, receipt_id)
+            if terminal.get("terminal") or terminal.get("status") in (
+                "complete", "partial", "failed",
+            ):
+                break
+            time.sleep(job_poll_interval)
+        result["confirm_path"] = "job"
+        result["job"] = terminal
+        if terminal.get("status") not in ("complete",):
+            raise NukezError(
+                f"finalize-upload job {job_id} did not complete: "
+                f"status={terminal.get('status')} error={terminal.get('error')}",
+                details={"job": terminal, "upload": result},
+            )
+        return result
+
+    def finalize_upload_job(
+        self,
+        receipt_id: str,
+        filenames: List[str],
+        auto_attest: bool = False,
+        attest_sync: bool = False,
+        push_attestation: bool = False,
+        run_inline: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Create the gateway's asynchronous upload-finalization job.
+
+        The job runs the batch confirm (the gateway streams each stored
+        object and records its verified hash) and, when requested, the
+        attestation — all off the request path, dispatched through the
+        gateway's task queue. Returns the creation response, whose job_id
+        is polled with get_job(). Auth: payer-signed envelope with
+        ops ["locker:write"].
+        """
+        signer = self._require_signer("finalize_upload_job", receipt_id)
+        locker_id = compute_locker_id(receipt_id)
+        body = {
+            "receipt_id": receipt_id,
+            "filenames": list(filenames),
+            "auto_attest": bool(auto_attest),
+            "attest_sync": bool(attest_sync),
+            "push_attestation": bool(push_attestation),
+            "run_inline": bool(run_inline),
+        }
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="POST",
+            path=f"/v1/lockers/{locker_id}/jobs/finalize-upload",
+            ops=["locker:write"],
+            body=body,
+            delegating=self._is_delegating(receipt_id),
+        )
+        return self.http.post(
+            f"/v1/lockers/{locker_id}/jobs/finalize-upload",
+            headers=envelope.headers,
+            data=envelope.canonical_body.encode("utf-8"),
+        )
+
+    def get_job(self, job_id: str, receipt_id: str) -> Dict[str, Any]:
+        """
+        Fetch the current state of a gateway job (GET /v1/jobs/{job_id}).
+
+        The receipt_id is required because the route demands a payer-signed
+        envelope with ops ["locker:read"], and the envelope is bound to the
+        receipt's locker. Terminal statuses are "complete", "partial", and
+        "failed"; the response's "terminal" field says so directly.
+        """
+        signer = self._require_signer("get_job", receipt_id)
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="GET",
+            path=f"/v1/jobs/{job_id}",
+            ops=["locker:read"],
+            delegating=self._is_delegating(receipt_id),
+        )
+        return self.http.get(f"/v1/jobs/{job_id}", headers=envelope.headers)
 
     def upload_directory(
         self,

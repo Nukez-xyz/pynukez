@@ -930,8 +930,18 @@ class AsyncNukez:
         filename: str,
         content_type: str = "application/octet-stream",
         ttl_min: int = 30,
+        expected_hash: Optional[str] = None,
+        expected_size_bytes: Optional[int] = None,
+        upload_mode: Optional[str] = None,
     ) -> FileUrls:
-        """Create a new file and get upload/download URLs."""
+        """Create a new file and get upload/download URLs.
+
+        Mirrors :meth:`Nukez.create_file`, including the large-blob fields:
+        expected_hash and expected_size_bytes pre-commit the object so
+        confirm can verify it, and upload_mode="resumable" asks the gateway
+        for a resumable-session opener. Optional fields are only sent when
+        set, keeping requests to older gateways byte-identical.
+        """
         signer = self._require_signer("create_file", receipt_id)
         locker_id = compute_locker_id(receipt_id)
 
@@ -940,6 +950,12 @@ class AsyncNukez:
             "content_type": content_type,
             "ttl_min": ttl_min,
         }
+        if expected_hash:
+            body["expected_hash"] = expected_hash
+        if expected_size_bytes is not None:
+            body["expected_size_bytes"] = int(expected_size_bytes)
+        if upload_mode:
+            body["upload_mode"] = upload_mode
 
         envelope = build_signed_envelope(
             signer=signer,
@@ -964,6 +980,10 @@ class AsyncNukez:
             content_type=response.get("content_type", content_type),
             expires_in_sec=response.get("urls_expire_in_sec", ttl_min * 60),
             confirm_url=response.get("confirm_url"),
+            upload_mode=response.get("upload_mode"),
+            resumable_upload=response.get("resumable_upload"),
+            expected_hash=response.get("expected_hash"),
+            expected_size_bytes=response.get("expected_size_bytes"),
         )
 
     async def create_files_batch(
@@ -1017,6 +1037,308 @@ class AsyncNukez:
             headers=envelope.headers,
             data=envelope.canonical_body.encode("utf-8"),
         )
+
+    # ------------------------------------------------------------------
+    # Large-blob resumable uploads (async twin of Nukez.upload_large_file)
+    # ------------------------------------------------------------------
+
+    async def _resumable_open_session(self, resumable_block: Dict[str, Any]) -> str:
+        """POST once to the gateway-minted session opener and return the
+        provider session URI from the Location header."""
+        url = resumable_block.get("url") or ""
+        headers = dict(resumable_block.get("headers") or {})
+        if not url:
+            raise NukezError("resumable_upload block carries no session-opener url")
+        resp = await self._raw_client.request(
+            (resumable_block.get("method") or "POST").upper(), url,
+            headers=headers, content=b"",
+        )
+        if resp.status_code not in (200, 201):
+            raise NukezError(
+                f"resumable session open failed: HTTP {resp.status_code} "
+                f"{resp.text[:200]}"
+            )
+        session_uri = resp.headers.get("Location") or resp.headers.get("location")
+        if not session_uri:
+            raise NukezError(
+                "resumable session open returned no Location header; cannot continue"
+            )
+        return session_uri
+
+    async def _resumable_committed_offset(self, session_uri: str, total_size: int) -> int:
+        """Ask the provider how many bytes it has committed for a session."""
+        resp = await self._raw_client.put(
+            session_uri, content=b"",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+        if resp.status_code in (200, 201):
+            return total_size
+        rng = resp.headers.get("Range") or resp.headers.get("range") or ""
+        if resp.status_code == 308:
+            if not rng:
+                return 0
+            try:
+                return int(rng.split("-")[-1]) + 1
+            except ValueError:
+                raise NukezError(f"unparseable committed Range header: {rng!r}")
+        raise NukezError(
+            f"resumable status query failed: HTTP {resp.status_code} {resp.text[:200]}"
+        )
+
+    async def upload_large_file(
+        self,
+        receipt_id: str,
+        filepath: str,
+        filename: Optional[str] = None,
+        content_type: Optional[str] = None,
+        ttl_min: int = 30,
+        chunk_bytes: Optional[int] = None,
+        confirm: bool = True,
+        auto_attest: bool = False,
+        push_attestation: bool = False,
+        threshold_bytes: Optional[int] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+        job_poll_interval: float = 3.0,
+        job_timeout: float = 900.0,
+    ) -> Dict[str, Any]:
+        """Async twin of :meth:`Nukez.upload_large_file` — see that
+        docstring for the full flow, auth model, and practical ceilings.
+        File digesting and chunk reads run in worker threads so the event
+        loop stays responsive; the transfer itself awaits httpx directly.
+        """
+        from .client import (
+            Nukez as _SyncNukez,
+            LARGE_UPLOAD_THRESHOLD_BYTES as _THRESHOLD,
+            RESUMABLE_CHUNK_BYTES as _CHUNK,
+            RESUMABLE_CHUNK_ALIGN_BYTES as _ALIGN,
+            RESUMABLE_MAX_RESUME_ATTEMPTS as _MAX_RESUMES,
+        )
+        chunk = int(chunk_bytes or _CHUNK)
+        threshold = int(threshold_bytes if threshold_bytes is not None else _THRESHOLD)
+
+        path = Path(filepath).expanduser()
+        if not path.is_file():
+            raise NukezError(f"upload_large_file: file not found: {path}")
+        if chunk <= 0 or chunk % _ALIGN != 0:
+            raise NukezError(
+                f"chunk_bytes must be a positive multiple of {_ALIGN} (got {chunk})"
+            )
+
+        name = self._sanitize_filename(filename or path.name)
+        ctype = self._infer_content_type(name, content_type)
+
+        total_size, sha_hex, crc_b64 = await asyncio.to_thread(
+            _SyncNukez._stream_file_digests, str(path)
+        )
+        if total_size == 0:
+            raise NukezError("upload_large_file: refusing to upload an empty file")
+
+        urls = await self.create_file(
+            receipt_id, name,
+            content_type=ctype, ttl_min=ttl_min,
+            expected_hash=f"sha256:{sha_hex}",
+            expected_size_bytes=total_size,
+            upload_mode="resumable",
+        )
+        block = urls.resumable_upload
+        if not block:
+            raise NukezError(
+                "The gateway did not return a resumable_upload block. Either "
+                "the deployed gateway predates resumable uploads or the "
+                "locker's storage provider does not support them; use "
+                "upload_file_path() (single signed PUT) instead."
+            )
+
+        session_uri = await self._resumable_open_session(block)
+
+        def _read_range(start: int, end: int) -> bytes:
+            with open(path, "rb") as fh:
+                fh.seek(start)
+                return fh.read(end - start + 1)
+
+        offset = 0
+        chunks_sent = 0
+        resume_count = 0
+        final_resp = None
+        while offset < total_size:
+            end = min(offset + chunk, total_size) - 1
+            data = await asyncio.to_thread(_read_range, offset, end)
+            headers = {
+                "Content-Range": f"bytes {offset}-{end}/{total_size}",
+                "Content-Type": ctype,
+            }
+            if end == total_size - 1 and crc_b64:
+                headers["x-goog-hash"] = f"crc32c={crc_b64}"
+            try:
+                resp = await self._raw_client.put(session_uri, content=data, headers=headers)
+            except _httpx.HTTPError as exc:
+                resume_count += 1
+                if resume_count > _MAX_RESUMES:
+                    raise NukezError(
+                        f"resumable upload failed after {_MAX_RESUMES} resume "
+                        f"attempts: {exc}"
+                    ) from exc
+                await asyncio.sleep(min(2.0 * resume_count, 10.0))
+                offset = await self._resumable_committed_offset(session_uri, total_size)
+                continue
+
+            if resp.status_code == 308:
+                rng = resp.headers.get("Range") or ""
+                try:
+                    offset = int(rng.split("-")[-1]) + 1 if rng else offset
+                except ValueError:
+                    offset = await self._resumable_committed_offset(session_uri, total_size)
+                chunks_sent += 1
+                if on_progress:
+                    try:
+                        on_progress(offset, total_size)
+                    except Exception:
+                        pass
+                continue
+            if resp.status_code in (200, 201):
+                chunks_sent += 1
+                final_resp = resp
+                offset = total_size
+                if on_progress:
+                    try:
+                        on_progress(offset, total_size)
+                    except Exception:
+                        pass
+                break
+            if resp.status_code in (408, 429, 500, 502, 503, 504):
+                resume_count += 1
+                if resume_count > _MAX_RESUMES:
+                    raise NukezError(
+                        f"resumable upload failed after {_MAX_RESUMES} resume "
+                        f"attempts: HTTP {resp.status_code} {resp.text[:200]}"
+                    )
+                await asyncio.sleep(min(2.0 * resume_count, 10.0))
+                offset = await self._resumable_committed_offset(session_uri, total_size)
+                continue
+            raise NukezError(
+                f"resumable chunk PUT failed: HTTP {resp.status_code} {resp.text[:300]}"
+            )
+
+        if final_resp is not None:
+            try:
+                resource = final_resp.json()
+            except Exception:
+                resource = {}
+            stored_size = int(resource.get("size") or 0)
+            if stored_size and stored_size != total_size:
+                raise NukezError(
+                    f"provider committed {stored_size} bytes but the local "
+                    f"file is {total_size} bytes"
+                )
+            stored_crc = resource.get("crc32c")
+            if stored_crc and crc_b64 and stored_crc != crc_b64:
+                raise NukezError(
+                    f"provider CRC32C {stored_crc!r} does not match the "
+                    f"locally computed {crc_b64!r}"
+                )
+
+        result: Dict[str, Any] = {
+            "filename": name,
+            "size_bytes": total_size,
+            "sha256": sha_hex,
+            "crc32c_base64": crc_b64,
+            "upload_mode": "resumable",
+            "chunks_sent": chunks_sent,
+            "resume_count": resume_count,
+        }
+
+        if not confirm:
+            result["confirm_path"] = "skipped"
+            return result
+
+        use_job = total_size >= threshold or auto_attest or push_attestation
+        if not use_job:
+            confirmed = await self.confirm_file(receipt_id, name)
+            result["confirm_path"] = "sync"
+            try:
+                from dataclasses import asdict, is_dataclass
+                result["confirm"] = asdict(confirmed) if is_dataclass(confirmed) else confirmed
+            except Exception:
+                result["confirm"] = confirmed
+            return result
+
+        job = await self.finalize_upload_job(
+            receipt_id, [name],
+            auto_attest=auto_attest,
+            push_attestation=push_attestation,
+        )
+        job_id = str(job.get("job_id") or "")
+        if not job_id:
+            raise NukezError(f"finalize-upload job creation returned no job_id: {job}")
+        deadline = time.time() + job_timeout
+        terminal = job
+        while time.time() < deadline:
+            terminal = await self.get_job(job_id, receipt_id)
+            if terminal.get("terminal") or terminal.get("status") in (
+                "complete", "partial", "failed",
+            ):
+                break
+            await asyncio.sleep(job_poll_interval)
+        result["confirm_path"] = "job"
+        result["job"] = terminal
+        if terminal.get("status") not in ("complete",):
+            raise NukezError(
+                f"finalize-upload job {job_id} did not complete: "
+                f"status={terminal.get('status')} error={terminal.get('error')}",
+                details={"job": terminal, "upload": result},
+            )
+        return result
+
+    async def finalize_upload_job(
+        self,
+        receipt_id: str,
+        filenames: List[str],
+        auto_attest: bool = False,
+        attest_sync: bool = False,
+        push_attestation: bool = False,
+        run_inline: bool = False,
+    ) -> Dict[str, Any]:
+        """Create the gateway's asynchronous upload-finalization job.
+        Mirrors :meth:`Nukez.finalize_upload_job` (ops ["locker:write"])."""
+        signer = self._require_signer("finalize_upload_job", receipt_id)
+        locker_id = compute_locker_id(receipt_id)
+        body = {
+            "receipt_id": receipt_id,
+            "filenames": list(filenames),
+            "auto_attest": bool(auto_attest),
+            "attest_sync": bool(attest_sync),
+            "push_attestation": bool(push_attestation),
+            "run_inline": bool(run_inline),
+        }
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="POST",
+            path=f"/v1/lockers/{locker_id}/jobs/finalize-upload",
+            ops=["locker:write"],
+            body=body,
+            delegating=self._is_delegating(receipt_id),
+        )
+        return await self.http.post(
+            f"/v1/lockers/{locker_id}/jobs/finalize-upload",
+            headers=envelope.headers,
+            data=envelope.canonical_body.encode("utf-8"),
+        )
+
+    async def get_job(self, job_id: str, receipt_id: str) -> Dict[str, Any]:
+        """Fetch a gateway job's state. Mirrors :meth:`Nukez.get_job`
+        (ops ["locker:read"]; terminal statuses are complete, partial,
+        and failed)."""
+        signer = self._require_signer("get_job", receipt_id)
+        envelope = build_signed_envelope(
+            signer=signer,
+            receipt_id=receipt_id,
+            method="GET",
+            path=f"/v1/jobs/{job_id}",
+            ops=["locker:read"],
+            delegating=self._is_delegating(receipt_id),
+        )
+        return await self.http.get(f"/v1/jobs/{job_id}", headers=envelope.headers)
 
     # ------------------------------------------------------------------
     # PATH-BASED UPLOADS
@@ -1093,6 +1415,18 @@ class AsyncNukez:
         normalized = self._normalize_path_sources(sources)
         t0 = time.time()
 
+        # Large-blob routing (async mirror of Nukez.bulk_upload_paths): files
+        # at or above the threshold take the resumable direct-to-provider
+        # path with their own confirm, and are excluded from the batch
+        # create and batch confirm.
+        from .client import LARGE_UPLOAD_THRESHOLD_BYTES as _THRESHOLD
+        for s in normalized:
+            try:
+                s["_size_bytes"] = os.path.getsize(s["filepath"])
+            except OSError:
+                s["_size_bytes"] = 0
+            s["_is_large"] = s["_size_bytes"] >= _THRESHOLD
+
         create_specs = [
             {
                 "filename": s["filename"],
@@ -1100,11 +1434,16 @@ class AsyncNukez:
                 "expected_hash": s.get("expected_hash"),
             }
             for s in normalized
+            if not s["_is_large"]
         ]
-        create_response = await self.create_files_batch(
-            receipt_id=receipt_id,
-            files=create_specs,
-            ttl_min=ttl_min,
+        create_response = (
+            await self.create_files_batch(
+                receipt_id=receipt_id,
+                files=create_specs,
+                ttl_min=ttl_min,
+            )
+            if create_specs
+            else {"files": []}
         )
 
         url_by_filename = {
@@ -1121,6 +1460,45 @@ class AsyncNukez:
 
         async def _upload_one(spec: Dict[str, Any]) -> Dict[str, Any]:
             filename = spec["filename"]
+
+            if spec.get("_is_large"):
+                try:
+                    large = await self.upload_large_file(
+                        receipt_id,
+                        spec["filepath"],
+                        filename=filename,
+                        content_type=spec["content_type"],
+                        ttl_min=ttl_min,
+                        confirm=confirm,
+                    )
+                    confirmed_hash = ""
+                    if large.get("confirm_path") == "sync":
+                        confirmed_hash = (large.get("confirm") or {}).get("content_hash", "")
+                    elif large.get("confirm_path") == "job":
+                        confirmed_hash = f"sha256:{large['sha256']}"
+                    return {
+                        "filename": large.get("filename", filename),
+                        "filepath": spec["filepath"],
+                        "content_type": spec["content_type"],
+                        "size_bytes": large.get("size_bytes", spec.get("_size_bytes", 0)),
+                        "success": True,
+                        "error": "",
+                        "large_upload": True,
+                        "confirmed": confirm,
+                        "content_hash": confirmed_hash,
+                        "resume_count": large.get("resume_count", 0),
+                    }
+                except Exception as e:
+                    return {
+                        "filename": filename,
+                        "filepath": spec["filepath"],
+                        "content_type": spec["content_type"],
+                        "size_bytes": spec.get("_size_bytes", 0),
+                        "success": False,
+                        "error": str(e),
+                        "large_upload": True,
+                    }
+
             entry = url_by_filename.get(filename)
             if not entry:
                 return {
@@ -1187,8 +1565,12 @@ class AsyncNukez:
                 })
             else:
                 file_results.append(r)
-                if r["success"]:
+                if r["success"] and not r.get("large_upload"):
                     uploaded_names.append(r["filename"])
+                elif r["success"]:
+                    # Large uploads confirm inside upload_large_file; keep
+                    # them out of the batch confirm.
+                    pass
                 else:
                     errors.append({
                         "filename": r["filename"],
@@ -1213,6 +1595,13 @@ class AsyncNukez:
 
         confirmed_count = 0
         for row in file_results:
+            if row.get("large_upload"):
+                # Confirmed (or deliberately skipped) inside
+                # upload_large_file; the row already carries its own
+                # confirmed flag and content_hash.
+                if row.get("confirmed"):
+                    confirmed_count += 1
+                continue
             if row["success"] and row["filename"] in confirmed_map:
                 c = confirmed_map[row["filename"]]
                 row["content_hash"] = c.content_hash
@@ -1226,7 +1615,10 @@ class AsyncNukez:
                 row["confirmed"] = False
 
         attestation: Optional[Dict[str, Any]] = None
-        if auto_attest and uploaded_names:
+        any_uploaded = bool(uploaded_names) or any(
+            r.get("large_upload") and r.get("success") for r in file_results
+        )
+        if auto_attest and any_uploaded:
             try:
                 att = await self.attest(receipt_id, sync=attest_sync)
                 attestation = {

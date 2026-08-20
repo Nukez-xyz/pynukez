@@ -216,6 +216,19 @@ class FileUrls:
     # None when talking to older gateways that don't return this field.
     confirm_url: Optional[str] = None
 
+    # Large-blob resumable uploads (gateway 2026-08 design). upload_mode is
+    # "put" or "resumable" as echoed by the gateway; resumable_upload is the
+    # session-opener block ({url, method, headers, chunk_alignment_bytes,
+    # session_ttl_sec, protocol, instructions}) present only when the file
+    # was created with upload_mode="resumable" on a provider that supports
+    # it. expected_hash / expected_size_bytes echo the client's
+    # pre-commitment; confirm refuses to record the manifest hash unless the
+    # stored bytes agree with both. All None on older gateways.
+    upload_mode: Optional[str] = None
+    resumable_upload: Optional[Dict[str, Any]] = None
+    expected_hash: Optional[str] = None
+    expected_size_bytes: Optional[int] = None
+
     # Agent guidance
     next_steps: str = (
         "PUT your raw bytes to upload_url via upload_bytes(upload_url=<the upload_url above>, "

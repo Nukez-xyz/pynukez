@@ -449,6 +449,14 @@ def get_tool_definitions() -> list:
                         "tx_sig": {
                             "type": "string",
                             "description": "On-chain transaction signature from the payment you completed with your own wallet, CLI, or signer"
+                        },
+                        "payment_chain": {
+                            "type": "string",
+                            "description": "Chain identifier for this payment (CAIP-2 like eip155:143, or a friendly name like monad-mainnet). REQUIRED for EVM payments; ignored for Solana. If omitted for an EVM-shaped tx_sig the gateway attempts inference, but passing it explicitly is the reliable path."
+                        },
+                        "payment_asset": {
+                            "type": "string",
+                            "description": "Token symbol the payment settled in (for example USDC, USDT, MON, WETH). REQUIRED for EVM payments; ignored for Solana. Must match one of the accepts[] legs from request_storage()."
                         }
                     },
                     "required": ["pay_req_id", "tx_sig"]
@@ -503,6 +511,20 @@ def get_tool_definitions() -> list:
                             "type": "integer",
                             "description": "URL expiration time in minutes",
                             "default": 30
+                        },
+                        "expected_hash": {
+                            "type": "string",
+                            "description": "Optional SHA-256 pre-commitment for the bytes you will upload (with or without the 'sha256:' prefix). The gateway refuses to confirm the upload unless the stored bytes hash to it."
+                        },
+                        "expected_size_bytes": {
+                            "type": "integer",
+                            "description": "Optional declared object size in bytes. Rejected up front when it exceeds the storage provider's limit; confirm refuses to record the manifest hash when the stored byte count disagrees.",
+                            "minimum": 1
+                        },
+                        "upload_mode": {
+                            "type": "string",
+                            "enum": ["put", "resumable"],
+                            "description": "'put' (default) returns the single signed upload URL; 'resumable' additionally returns a resumable_upload session-opener block for large objects (provider must support it; GCS does). For large local files, prefer nukez_upload_large_file, which drives the whole resumable flow for you."
                         }
                     },
                     "required": ["receipt_id"]
@@ -736,6 +758,93 @@ def get_tool_definitions() -> list:
                         }
                     },
                     "required": ["job_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nukez_upload_large_file",
+                "description": "Upload one local file of ANY size through the resumable direct-to-provider path, then confirm it. Streams the file from disk (never loads it whole), pre-commits its SHA-256 and size, uploads in aligned chunks with automatic resume after interruptions, has the provider verify a whole-object checksum, and routes confirmation synchronously below the size threshold or through the gateway's asynchronous finalize job at or above it (polled to completion). Prefer this over nukez_upload_file_path for files above roughly 100 MB, and always for multi-gigabyte files. Context-safe: only the path passes through the tool call.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "receipt_id": {
+                            "type": "string",
+                            "description": "Receipt ID from confirm_storage()"
+                        },
+                        "filepath": {
+                            "type": "string",
+                            "description": "Absolute path of the local file to upload"
+                        },
+                        "filename": {
+                            "type": "string",
+                            "description": "Stored name (defaults to the path's basename)"
+                        },
+                        "content_type": {
+                            "type": "string",
+                            "description": "MIME type (inferred from the name when omitted)"
+                        },
+                        "confirm": {
+                            "type": "boolean",
+                            "description": "Confirm after upload (default true). When false, the caller owns the confirm step.",
+                            "default": True
+                        },
+                        "auto_attest": {
+                            "type": "boolean",
+                            "description": "Run attestation in the finalize job after confirm (forces the job path)",
+                            "default": False
+                        }
+                    },
+                    "required": ["receipt_id", "filepath"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nukez_finalize_upload_job",
+                "description": "Create the gateway's asynchronous upload-finalization job for already-uploaded files: it confirms each file (the gateway streams the stored bytes and records the verified hash) and optionally attests, all off the request path. Returns a job_id to poll with nukez_get_job. Use when confirming large objects whose synchronous confirm would be slow; nukez_upload_large_file uses this automatically.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "receipt_id": {
+                            "type": "string",
+                            "description": "Receipt ID bound to the locker"
+                        },
+                        "filenames": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Filenames to confirm and finalize in one job"
+                        },
+                        "auto_attest": {
+                            "type": "boolean",
+                            "description": "Run attestation after the batch confirm completes",
+                            "default": False
+                        }
+                    },
+                    "required": ["receipt_id", "filenames"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "nukez_get_job",
+                "description": "Fetch the current state of a gateway job created by nukez_finalize_upload_job. Terminal statuses are 'complete', 'partial', and 'failed'; the response's 'terminal' field says so directly.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "job_id": {
+                            "type": "string",
+                            "description": "Job identifier returned by nukez_finalize_upload_job"
+                        },
+                        "receipt_id": {
+                            "type": "string",
+                            "description": "Receipt ID whose locker the job belongs to (the read is payer-signed)"
+                        }
+                    },
+                    "required": ["job_id", "receipt_id"]
                 }
             }
         },
