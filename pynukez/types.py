@@ -251,6 +251,24 @@ class VerificationResult:
     files: Optional[List[Dict[str, Any]]] = None  # [{filename, content_hash, size_bytes}, ...]
     locker_id: str = ""
     verify_url: str = ""
+    # Provider-neutral proof fields. Newer gateways return them; they stay
+    # None when the gateway is older and does not send them.
+    # The anchor object describes the on-chain anchor of this record. It
+    # carries "type" ("solana_sas_v1", "solana_memo_v2", or "switchboard_v2"
+    # for historical records), "chain", "tx", "slot", and further details.
+    # It is None when the record has no on-chain anchor.
+    anchor: Optional[Dict[str, Any]] = None
+    # The verification facts object. Every value is one of "passed",
+    # "failed", "not_checked", or "unavailable". The fact named
+    # "anchor_confirmed" is the one that says the record is anchored on-chain.
+    verification: Optional[Dict[str, str]] = None
+    # The public proof identifier of a version two record. It is random and
+    # it is never the receipt id.
+    proof_id: Optional[str] = None
+    # The historical Switchboard transaction recorded inside the attestation.
+    # The gateway populates it only for Switchboard-era records. It is the
+    # fallback for anchor_tx when the gateway does not send an anchor object.
+    switchboard_tx: Optional[str] = None
     
     @property
     def status(self) -> str:
@@ -260,6 +278,34 @@ class VerificationResult:
     def attested(self) -> bool:
         """True if an on-chain attestation exists (merkle_root computed)."""
         return bool(self.merkle_root)
+
+    @property
+    def anchored(self) -> bool:
+        """True when the record is confirmed as anchored on-chain.
+
+        When the gateway sends the verification facts, this property is True
+        only when the fact "anchor_confirmed" has the value "passed". When the
+        gateway is older and sends no facts, this property falls back to the
+        legacy signal, which is an attestation that carries a Switchboard
+        transaction. This property is different from ``attested``, which only
+        says that a merkle root has been computed.
+        """
+        facts = self.verification
+        if isinstance(facts, dict) and "anchor_confirmed" in facts:
+            return facts.get("anchor_confirmed") == "passed"
+        return bool(self.switchboard_tx)
+
+    @property
+    def anchor_tx(self) -> Optional[str]:
+        """The on-chain anchor transaction, or None when there is none.
+
+        The transaction is taken from the anchor object first. The historical
+        Switchboard transaction is used only when the gateway sent no anchor
+        object.
+        """
+        if isinstance(self.anchor, dict):
+            return self.anchor.get("tx") or None
+        return self.switchboard_tx or None
 
 @dataclass
 class ReceiptHashVerification:
@@ -504,9 +550,27 @@ class AttestResult:
     file_count: int
     att_code: Optional[int] = None
     status: str = "accepted"   # "complete" or "accepted"
-    push_ok: bool = False      # True if Switchboard push succeeded
+    push_ok: bool = False      # True if the on-chain anchor push succeeded
     tx_signature: Optional[str] = None
+    # This field keeps its historical name for backward compatibility. The
+    # attest() method fills it with the slot of the anchor transaction for
+    # every anchor type, so it does not mean that Switchboard was used.
+    # Prefer anchor_slot, and read anchor_type to learn which kind of anchor
+    # was written.
     switchboard_slot: Optional[int] = None
+    # Provider-neutral anchor fields. Newer gateways return them; they stay
+    # None when the gateway is older and does not send them.
+    # The anchor object carries "type", "chain", "tx", "slot", and further
+    # details about the on-chain anchor.
+    anchor: Optional[Dict[str, Any]] = None
+    # The anchor type is "solana_sas_v1", "solana_memo_v2", or
+    # "switchboard_v2" for historical records.
+    anchor_type: Optional[str] = None
+    # The slot of the anchor transaction.
+    anchor_slot: Optional[int] = None
+    # The verification facts object. Every value is one of "passed",
+    # "failed", "not_checked", or "unavailable".
+    verification: Optional[Dict[str, str]] = None
 
 
 @dataclass

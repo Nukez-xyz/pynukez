@@ -173,7 +173,7 @@ Every method is a self-contained tool. Explicit parameters, predictable dataclas
 Pay with SOL on Solana or MON/WETH on Monad. PyNukez provides the quote and confirms the transaction signature; your wallet, CLI, signer, or custody workflow executes the transfer. Ed25519 + secp256k1 envelope signing.
 
 **Card 3: Cryptographic Verification**
-SHA-256 content hashes, merkle tree attestation, on-chain anchoring via Switchboard. Independently verifiable without trusting anyone.
+SHA-256 content hashes, merkle tree attestation, and an on-chain anchor. Independently verifiable without trusting anyone.
 
 **Card 4: Operator Delegation**
 Delegate file operations to other signers without sharing keys. Owner adds/removes operators. Operators sign with their own identity.

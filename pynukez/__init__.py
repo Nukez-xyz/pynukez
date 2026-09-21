@@ -119,6 +119,14 @@ from .discovery import (
     get_current_price,
 )
 
+# Evidence bundle verification. The functions verify_offline, verify_online,
+# and merkle_root_v1 check a bundle from get_evidence_bundle() without
+# trusting the gateway. They live in pynukez.verify, and the package loads
+# them on first use through __getattr__ below. The import is deferred so that
+# "python -m pynukez.verify" runs without a warning about a module that was
+# imported twice.
+_VERIFY_EXPORTS = ("verify_offline", "verify_online", "merkle_root_v1")
+
 # The version string lives in _version.py so the HTTP layer's User-Agent
 # header can derive from the same value without a circular import.
 from ._version import __version__
@@ -189,11 +197,25 @@ __all__ = [
     "discover",
     "health_check",
     "get_current_price",
+
+    # Evidence bundle verification
+    "verify_offline",
+    "verify_online",
+    "merkle_root_v1",
     
     # Agent integration functions
     "get_agent_instructions",
     "get_tool_definitions",
 ]
+
+
+def __getattr__(name: str):
+    """Load the evidence bundle verification functions on first use."""
+    if name in _VERIFY_EXPORTS:
+        from . import verify as _verify_module
+
+        return getattr(_verify_module, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_agent_instructions() -> dict:
@@ -323,6 +345,8 @@ def get_agent_instructions() -> dict:
                 "verify_receipt_hash": "Recompute and compare the receipt object's canonical hash",
                 "receipt_hash_matches": "Boolean convenience helper for receipt hash checks",
                 "verify_storage": "Get cryptographic attestation — returns merkle_root, manifest_signature, att_code, per-file hashes",
+                "get_evidence_bundle": "Fetch the portable evidence bundle for a receipt. Check it with pynukez.verify.verify_offline() and verify_online().",
+                "get_signing_keys": "Fetch the gateway's published signing keys. Pin them out of band for a fully independent check.",
                 "compute_hash": "Calculate SHA256 for local verification"
             },
             "utilities": {

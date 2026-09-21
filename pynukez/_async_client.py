@@ -78,6 +78,13 @@ from .errors import (
 from .hardening import sanitize_upload_data, validate_signed_url
 from ._async_http import AsyncHTTPClient
 from ._helpers import _is_gateway_short_url, _validated_confirm_url
+from ._helpers import (
+    _verification_extras,
+    _attest_anchor_fields,
+    _attest_outcome_from_verification,
+    _sign_confirm_intent,
+    _confirm_error_from_response,
+)
 from ._http import caip2_to_friendly
 
 VIEWER_RENDERER_CONTRACT_NAME = "nukez.mcp.viewer_link"
@@ -657,8 +664,32 @@ class AsyncNukez:
         payment_chain: Optional[str] = None,
         payment_asset: Optional[str] = None,
         operator_pubkey: Optional[str] = None,
+        payer_signature: Optional[str] = None,
     ) -> Receipt:
-        """Step 3: Confirm payment and receive storage receipt (with retry)."""
+        """Step 3: Confirm payment and receive storage receipt (with retry).
+
+        The ``payer_signature`` argument is the payer's signature over the
+        confirm intent. Newer gateways ask for it when an operator is being
+        bound. The signed message is the UTF-8 encoding of this exact text,
+        with the four parts joined by the vertical bar character:
+
+            nukez/confirm/v1|<pay_req_id>|<tx_sig>|<operator_pubkey>
+
+        Write a single hyphen in place of the operator public key when no
+        operator is being bound. A Solana payer signs the message with
+        Ed25519 and passes the signature in base58. An EVM payer signs it
+        with EIP-191 personal_sign and passes the signature as hex with the
+        "0x" prefix. The helper ``pynukez._helpers.confirm_intent_message()``
+        builds the message bytes.
+
+        When the argument is omitted and an operator is being bound, the SDK
+        signs the message itself if the client holds a key that could belong
+        to the payer. That key must use the signature algorithm of the
+        payment chain, and it must not be the operator that is being bound.
+        When the client holds no such key, the confirm is sent without a
+        signature, exactly as before. A confirm is never refused by the SDK
+        because signing was unavailable.
+        """
         url = f"{self.base_url}/v1/storage/confirm"
         payload = {"pay_req_id": pay_req_id}
         if payment_chain:
@@ -684,6 +715,20 @@ class AsyncNukez:
                 stacklevel=2,
             )
             payload["operator_pubkey"] = self.keypair.pubkey_b58
+        # Payer-signed confirm intent. An explicit signature always wins.
+        # Otherwise the SDK signs only when an operator is being bound and
+        # the client holds a key that could belong to the payer. The helper
+        # returns None instead of raising, so signing can never fail a confirm.
+        intent_signature = (payer_signature or "").strip() if isinstance(payer_signature, str) else ""
+        if not intent_signature and payload.get("operator_pubkey"):
+            intent_signature = _sign_confirm_intent(
+                pay_req_id=pay_req_id,
+                tx_sig=tx_sig,
+                operator_pubkey=payload["operator_pubkey"],
+                signers=[self._evm_signer, self._signer, self.keypair],
+            ) or ""
+        if intent_signature:
+            payload["payer_signature"] = intent_signature
         headers = {
             "Content-Type": "application/json",
             "X402-TX": tx_sig,
@@ -777,6 +822,19 @@ class AsyncNukez:
                         details=body,
                     )
                     raise last_error
+
+                # The newer confirm error codes are permanent. They are raised
+                # at once with their structured details, because retrying
+                # them cannot succeed. Every other status keeps the handling
+                # below.
+                if isinstance(resp.status_code, int) and resp.status_code >= 400:
+                    try:
+                        error_body = resp.json()
+                    except Exception:
+                        error_body = None
+                    confirm_error = _confirm_error_from_response(resp.status_code, error_body)
+                    if confirm_error is not None:
+                        raise confirm_error
 
                 resp.raise_for_status()
 
@@ -2596,6 +2654,14 @@ class AsyncNukez:
         nine-digit integer derived from result_hash (strip "sha256:",
         first 12 hex characters as an integer, modulo 1,000,000,000); it
         is never hex and never derived from merkle_root.
+
+        When the gateway sends them, the result also carries the
+        provider-neutral ``anchor`` object, the separate ``verification``
+        facts, and the public ``proof_id``. Use the ``anchored`` property,
+        and not ``verified``, to say that a record is anchored on-chain. The
+        ``verified`` flag only means that an attestation record exists and is
+        not pending. The ``anchor_tx`` property gives the anchor transaction.
+        All of these are None or False when the gateway is older.
         """
         response = await self.http.get(
             "/v1/storage/verify",
@@ -2616,7 +2682,46 @@ class AsyncNukez:
             files=attestation.get("files"),
             locker_id=response.get("locker_id", attestation.get("locker_id", "")),
             verify_url=response.get("verify_url", ""),
+            # Provider-neutral proof fields. Every one is None when the
+            # gateway is older and does not send it.
+            **_verification_extras(response, attestation),
         )
+
+    async def get_evidence_bundle(self, receipt_id: str) -> dict:
+        """Fetch the portable evidence bundle for a receipt.
+
+        The bundle holds everything a third party needs to check a proof
+        without trusting the gateway: the file list, the committed merkle
+        root, the signed envelope (or the version one signature for a
+        historical record), the on-chain anchor object, the verification
+        facts, and the gateway's signing keys. Check it with
+        ``pynukez.verify.verify_offline()`` and
+        ``pynukez.verify.verify_online()``, or with the ``nukez-verify``
+        command. Pin the signing key out of band, because a key that arrives
+        inside the bundle proves self-consistency only.
+
+        Gateway endpoint: ``GET /v1/storage/evidence-bundle?receipt_id=...``.
+        The endpoint is open and needs no signed envelope. The gateway
+        answers with HTTP 409 while no computed attestation exists yet, and
+        an older gateway that lacks the endpoint answers with HTTP 404. Both
+        cases raise ``NukezError``.
+        """
+        return await self.http.get(
+            "/v1/storage/evidence-bundle",
+            params={"receipt_id": receipt_id},
+        )
+
+    async def get_signing_keys(self) -> dict:
+        """Fetch the gateway's published signing keys.
+
+        Gateway endpoint: ``GET /v1/keys``. The endpoint is open and needs no
+        signed envelope. The response holds ``schema`` and ``keys``, where
+        every key is a dict with ``key_id``, ``alg``, ``public_key_hex``,
+        ``use``, and ``status``. A key list served by the same gateway that
+        produced the evidence proves self-consistency only, so a verifier
+        that wants to be fully trust-free should pin the keys out of band.
+        """
+        return await self.http.get("/v1/keys")
 
     async def get_merkle_proof(self, receipt_id: str, filename: str) -> dict:
         """Get a merkle inclusion proof for a specific file."""
@@ -2932,6 +3037,15 @@ class AsyncNukez:
             timeout: Optional per-call timeout (seconds). Defaults to the
                 client's effective timeout (120s), which comfortably covers
                 the gateway's default 90-second server-side poll ceiling.
+
+        Returns:
+            AttestResult with merkle_root, file_count, att_code, status,
+            push_ok, tx_signature, switchboard_slot, anchor, anchor_type,
+            anchor_slot. The anchor fields are None when the gateway is
+            older and does not send them. The switchboard_slot field keeps
+            its historical name and holds the slot of the anchor transaction
+            for every anchor type, so read anchor_type to learn which kind
+            of anchor was written.
         """
         params = {"receipt_id": receipt_id}
         if sync:
@@ -2972,6 +3086,9 @@ class AsyncNukez:
             push_ok=push_result.get("ok", False),
             tx_signature=push_result.get("tx_signature"),
             switchboard_slot=push_result.get("slot"),
+            # Provider-neutral anchor fields. Every one is None when the
+            # gateway is older and does not send it.
+            **_attest_anchor_fields(response),
         )
 
     async def attest_async(
@@ -2990,7 +3107,7 @@ class AsyncNukez:
 
         Cloud Tasks dedup window is 5 seconds: two ``attest_async()`` calls
         within 5 sec for the same receipt collapse to a single on-chain push,
-        saving a Switchboard fee for back-to-back batch workflows.
+        saving an on-chain anchor fee for back-to-back batch workflows.
 
         Args:
             receipt_id: Receipt ID from confirm_storage().
@@ -3003,6 +3120,18 @@ class AsyncNukez:
             ``tx_signature`` and ``switchboard_slot`` may be ``None`` here
             even when ``merkle_root`` is populated — call
             ``verify_storage()`` again after settlement to pick them up.
+
+            When the gateway sends the verification facts, ``push_ok`` is
+            True only when the fact "anchor_confirmed" is "passed", so a
+            record whose merkle root is computed but not yet anchored
+            reports ``push_ok=False``. This method returns as soon as a
+            merkle root exists, which can be before the anchor settles. In
+            that case poll ``verify_storage()`` until its ``anchored``
+            property is True. When the gateway sends an anchor object,
+            ``tx_signature``, ``anchor``, ``anchor_type``, and
+            ``anchor_slot`` are filled from it. When the gateway is older
+            and sends neither, ``push_ok`` follows the attestation code as
+            it always has.
 
         Raises:
             NukezError("attest_timeout: ..."): max_wait exceeded with no
@@ -3017,15 +3146,16 @@ class AsyncNukez:
                 att_code_int: Optional[int] = None
                 if v.att_code and str(v.att_code).strip().lstrip("-").isdigit():
                     att_code_int = int(v.att_code)
+                # The helper returns push_ok, tx_signature, switchboard_slot,
+                # and the anchor fields. For an older gateway it returns the
+                # values this method has always reported.
                 return AttestResult(
                     receipt_id=receipt_id,
                     merkle_root=v.merkle_root,
                     file_count=v.file_count,
                     att_code=att_code_int,
                     status="complete",
-                    push_ok=bool(v.att_code),
-                    tx_signature=None,
-                    switchboard_slot=None,
+                    **_attest_outcome_from_verification(v),
                 )
             await asyncio.sleep(poll_interval)
 

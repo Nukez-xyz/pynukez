@@ -13,7 +13,7 @@ import re
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlsplit
 
-from .errors import NukezError
+from .errors import AuthenticationError, NukezError
 
 
 def _is_gateway_short_url(url: str) -> bool:
@@ -423,3 +423,276 @@ def make_file_preview_block(
     if size_bytes is not None:
         block["size_bytes"] = size_bytes
     return block
+
+
+# ---------------------------------------------------------------------------
+# Provider-neutral proof readers
+# ---------------------------------------------------------------------------
+#
+# Newer gateways describe the on-chain anchor of a record with an "anchor"
+# object and report separate "verification" facts. Older gateways send
+# neither. Every reader below tolerates their absence, so that a response
+# from an older gateway is read exactly as it was read before.
+
+ANCHOR_CONFIRMED_FACT = "anchor_confirmed"
+FACT_PASSED = "passed"
+ANCHOR_TYPE_SWITCHBOARD = "switchboard_v2"
+
+
+def _dict_or_none(value: Any) -> Optional[Dict[str, Any]]:
+    """Return the value when it is a non-empty dict, and None otherwise."""
+    return value if isinstance(value, dict) and value else None
+
+
+def _verification_extras(response: Dict[str, Any], attestation: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the provider-neutral proof fields from a verify response.
+
+    The gateway sends "anchor" and "verification" at the top level of the
+    response, and it stores "proof_id" inside the attestation object. New
+    records also carry the anchor inside the attestation object, so that copy
+    is used when the top level has none. The historical "switchboard_tx" is
+    read from the attestation object so that the result can fall back to it
+    when the gateway sends no anchor object.
+
+    The returned dict holds keyword arguments for ``VerificationResult``.
+    Every value is None when the gateway is older and does not send the field.
+    """
+    response = response if isinstance(response, dict) else {}
+    attestation = attestation if isinstance(attestation, dict) else {}
+    anchor = _dict_or_none(response.get("anchor")) or _dict_or_none(attestation.get("anchor"))
+    proof_id = attestation.get("proof_id")
+    switchboard_tx = attestation.get("switchboard_tx")
+    return {
+        "anchor": anchor,
+        "verification": _dict_or_none(response.get("verification")),
+        "proof_id": str(proof_id) if proof_id else None,
+        "switchboard_tx": str(switchboard_tx) if switchboard_tx else None,
+    }
+
+
+def _attest_anchor_fields(response: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the provider-neutral anchor fields from an attest response.
+
+    The anchor object is taken from ``push_result.anchor``. Some gateway
+    paths report a successful push without repeating the anchor object inside
+    ``push_result``. In that case the anchor object at the top level of the
+    response is used, but only when the push succeeded and that object names
+    the same transaction as ``push_result.tx_signature``.
+
+    The returned dict holds keyword arguments for ``AttestResult``. Every
+    value except ``anchor_slot`` is None when the gateway is older and does
+    not send the field. The slot falls back to ``push_result.slot``, because
+    that value is the slot of the anchor transaction for every anchor type.
+    """
+    response = response if isinstance(response, dict) else {}
+    push_result = response.get("push_result")
+    push_result = push_result if isinstance(push_result, dict) else {}
+
+    anchor = _dict_or_none(push_result.get("anchor"))
+    if anchor is None and push_result.get("ok"):
+        top_level = _dict_or_none(response.get("anchor"))
+        if (
+            top_level is not None
+            and top_level.get("tx")
+            and top_level.get("tx") == push_result.get("tx_signature")
+        ):
+            anchor = top_level
+
+    anchor_type = push_result.get("anchor_type") or (anchor or {}).get("type")
+    anchor_slot = (anchor or {}).get("slot")
+    if anchor_slot is None:
+        anchor_slot = push_result.get("slot")
+
+    return {
+        "anchor": anchor,
+        "anchor_type": str(anchor_type) if anchor_type else None,
+        "anchor_slot": anchor_slot,
+        "verification": _dict_or_none(response.get("verification")),
+    }
+
+
+def _attest_outcome_from_verification(verification_result: Any) -> Dict[str, Any]:
+    """Describe the anchor outcome for ``attest_async`` from a verify result.
+
+    When the verify result carries the verification facts, ``push_ok`` is
+    True only when the fact "anchor_confirmed" has the value "passed". A
+    record whose merkle root was computed but not anchored therefore reports
+    ``push_ok=False``. When the verify result carries an anchor object, the
+    transaction, the anchor type, and the slot are taken from it. The
+    historical ``switchboard_slot`` is filled only for a historical
+    Switchboard anchor.
+
+    When the verify result carries neither field, the gateway is older, and
+    the returned values are exactly the ones that ``attest_async`` has always
+    reported: ``push_ok`` follows the attestation code, and the transaction
+    and the slot are None.
+
+    The returned dict holds keyword arguments for ``AttestResult``.
+    """
+    facts = _dict_or_none(getattr(verification_result, "verification", None))
+    anchor = _dict_or_none(getattr(verification_result, "anchor", None))
+    legacy_push_ok = bool(getattr(verification_result, "att_code", ""))
+
+    if facts is not None and ANCHOR_CONFIRMED_FACT in facts:
+        push_ok = facts.get(ANCHOR_CONFIRMED_FACT) == FACT_PASSED
+    else:
+        push_ok = legacy_push_ok
+
+    anchor_type = (anchor or {}).get("type")
+    anchor_slot = (anchor or {}).get("slot")
+    return {
+        "push_ok": push_ok,
+        "tx_signature": (anchor or {}).get("tx") or None,
+        "switchboard_slot": anchor_slot if anchor_type == ANCHOR_TYPE_SWITCHBOARD else None,
+        "anchor": anchor,
+        "anchor_type": str(anchor_type) if anchor_type else None,
+        "anchor_slot": anchor_slot,
+        "verification": facts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Payer-signed confirm intent
+# ---------------------------------------------------------------------------
+
+CONFIRM_INTENT_PREFIX = "nukez/confirm/v1"
+
+
+def confirm_intent_message(pay_req_id: str, tx: str, operator_pubkey: Optional[str] = None) -> bytes:
+    """Return the exact bytes that a payer signs to authorize a confirm.
+
+    The message is the UTF-8 encoding of four parts joined by the vertical
+    bar character: the text "nukez/confirm/v1", the pay request id, the
+    transaction signature or hash, and the operator public key. A single
+    hyphen stands in for the operator when no operator is being bound.
+
+    A Solana payer signs these bytes with Ed25519 and sends the signature in
+    base58. An EVM payer signs these bytes with EIP-191 personal_sign and
+    sends the signature as hex with the "0x" prefix.
+    """
+    operator = (operator_pubkey or "").strip() or "-"
+    return f"{CONFIRM_INTENT_PREFIX}|{pay_req_id}|{str(tx).strip()}|{operator}".encode("utf-8")
+
+
+def _sign_confirm_intent(
+    *,
+    pay_req_id: str,
+    tx_sig: Any,
+    operator_pubkey: Optional[str],
+    signers: List[Any],
+) -> Optional[str]:
+    """Sign the confirm intent with a key that could belong to the payer.
+
+    The client does not know for certain who paid, so this function applies
+    two rules. The key must use the signature algorithm of the payment chain,
+    which is secp256k1 for an EVM transaction hash that starts with "0x" and
+    Ed25519 otherwise. The key must not be the operator that is being bound,
+    because the gateway refuses an operator that is also the payer.
+
+    The function returns None when no operator is being bound, when no
+    suitable key is held, or when signing fails for any reason. It never
+    raises, so a confirm is never refused because signing was unavailable.
+    """
+    try:
+        operator = (operator_pubkey or "").strip()
+        tx = str(tx_sig or "").strip()
+        if not operator or not tx or not pay_req_id:
+            return None
+        is_evm = tx.startswith("0x")
+        wanted_alg = "secp256k1" if is_evm else "ed25519"
+        message = confirm_intent_message(pay_req_id, tx, operator)
+        seen: List[int] = []
+        for signer in signers:
+            if signer is None or id(signer) in seen:
+                continue
+            seen.append(id(signer))
+            if getattr(signer, "sig_alg", None) != wanted_alg:
+                continue
+            identity = getattr(signer, "identity", None)
+            if not isinstance(identity, str) or not identity:
+                continue
+            same_key = identity.lower() == operator.lower() if is_evm else identity == operator
+            if same_key:
+                continue
+            signature = signer.sign(message)
+            if isinstance(signature, str) and signature:
+                return signature
+        return None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Newer error codes from POST /v1/storage/confirm
+# ---------------------------------------------------------------------------
+
+# A 402 response with one of these codes is permanent, so confirm_storage()
+# must not retry it.
+CONFIRM_PERMANENT_402_CODES = ("PAYMENT_OUTSIDE_QUOTE_WINDOW",)
+
+_CONFIRM_GUIDANCE = {
+    "PAYMENT_ALREADY_ALLOCATED": (
+        "This transaction has already paid for a different pay request. Each "
+        "payment buys one request, so make a new payment for this request. "
+        "Retrying the same pay request with its own transaction is still safe."
+    ),
+    "PAYMENT_OPTION_NOT_IN_QUOTE": (
+        "The quote did not offer this asset on this chain. Request a new "
+        "quote, or pay with one of the options that the quote lists."
+    ),
+    "CONFIRM_INTENT_REQUIRED": (
+        "Binding an operator requires the payer's signature over the confirm "
+        "intent. Sign the exact text in details['sign_this'] with the payer "
+        "key and pass the result as payer_signature."
+    ),
+    "CONFIRM_INTENT_INVALID": (
+        "The payer_signature did not verify against the payer of this "
+        "transaction. Sign the exact text in details['sign_this'] with the "
+        "payer key and pass the result as payer_signature."
+    ),
+}
+
+
+def _confirm_error_from_response(status_code: int, body: Any) -> Optional[NukezError]:
+    """Return the SDK error for one of the newer confirm error codes.
+
+    The function returns None for every other response, so that the caller
+    keeps its existing handling. The two confirm intent codes arrive with
+    HTTP 401 and map to ``AuthenticationError``, which is the class the SDK
+    already uses for a rejected signature. The other codes have no dedicated
+    class and map to ``NukezError``. Every returned error is marked as not
+    retryable and carries the full response body in ``details``.
+    """
+    if not isinstance(body, dict):
+        return None
+    nested = body.get("detail") if isinstance(body.get("detail"), dict) else {}
+    raw_code = (
+        body.get("error_code")
+        or nested.get("error_code")
+        or body.get("error")
+        or nested.get("error")
+        or ""
+    )
+    error_code = str(raw_code).strip().upper()
+    guidance = _CONFIRM_GUIDANCE.get(error_code)
+    if guidance is None:
+        return None
+
+    gateway_message = str(body.get("message") or nested.get("message") or "").strip()
+    message = f"Payment confirmation failed ({error_code}): {gateway_message} {guidance}".replace("  ", " ")
+
+    details: Dict[str, Any] = dict(body)
+    details["error_code"] = error_code
+    details["status_code"] = status_code
+    inner = body.get("details") if isinstance(body.get("details"), dict) else {}
+    sign_this = inner.get("sign_this") or nested.get("sign_this") or body.get("sign_this")
+    if sign_this:
+        details["sign_this"] = sign_this
+
+    if error_code in ("CONFIRM_INTENT_REQUIRED", "CONFIRM_INTENT_INVALID"):
+        error: NukezError = AuthenticationError(message=message)
+        error.details.update(details)
+    else:
+        error = NukezError(message, details=details)
+    error.retryable = False
+    return error
