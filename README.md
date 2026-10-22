@@ -10,6 +10,13 @@
 pip install pynukez
 ```
 
+**Minimum installer versions:** pip >= 26.2.2, uv/uvx >= 0.13.4, pipx >= 1.18.4
+(and npm/npx on Node >= 22.23.4 / 24.22.1 / 26.12.1 for JavaScript tooling).
+Older installers ship a CA bundle that still trusts the compromised eMudhra/emSign
+intermediate CAs (2026-10-22), so they can be served a tampered package even when
+the operating system has already revoked that chain; pynukez itself requires
+`certifi >= 2026.10.19` at runtime.
+
 Native support for both Solana and Monad blockchains. Thus, this includes support for Ed25519 and secp256k1 keypairs. The entire PyNukez library is designed and built for direct integration with agentic systems. The landmark agentic storage protocol is optimized for use by autonomous agents. Compatible with any model provider, agentic platform, or other integrations.
 
 Requires Python 3.9+.
